@@ -1,0 +1,17 @@
+{
+  "name": "vibefoundry-app-plugins",
+  "version": "0.1.0",
+  "description": "Opens the VibeFoundry IDE as a pane inside Codex / ChatGPT. A launcher, not an IDE — everything it shows belongs to the vibefoundry python package.",
+  "private": true,
+  "type": "commonjs",
+  "main": "server/index.js",
+  "scripts": {
+    "register": "node server/register.js",
+    "unregister": "node server/register.js --remove",
+    "selftest": "node server/selftest.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
