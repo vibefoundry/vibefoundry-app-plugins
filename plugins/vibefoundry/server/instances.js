@@ -13,10 +13,12 @@
 const net = require("net");
 const { execFile } = require("child_process");
 
-// The library's find_available_port() walks up from 8765, so instances land in a
-// narrow band regardless of who launched them.
+// Mirrors the library's find_available_port(start_port=8765, max_attempts=100):
+// it binds upward from 8765 and gives up at 8865, so that is exactly the band an
+// instance can land in, whoever launched it. Scanning a narrower range would go
+// blind precisely when a lot of instances are already up.
 const PORT_START = 8765;
-const PORT_END = 8799;
+const PORT_END = 8864;
 
 function portOpen(port, timeoutMs = 120) {
   return new Promise((resolve) => {

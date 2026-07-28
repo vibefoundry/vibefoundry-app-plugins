@@ -19,7 +19,7 @@
 
 const fs = require("fs");
 const { discover, stop } = require("./instances");
-const { launch, paneHtmlPath, isInstalled } = require("./launch");
+const { launch, paneHtmlPath, isInstalled, sameFolder } = require("./launch");
 
 // --- Apps SDK wiring ----------------------------------------------------------
 // If the pane does not render, these are the two values most likely to need
@@ -46,8 +46,33 @@ const INSTRUCTIONS =
   "the user verbatim and call the tool again with shutdown_existing set to their " +
   "answer. Never call vf_request yourself: it exists only for the pane UI.";
 
-// The backend the pane is currently pointed at. Set when we launch or adopt one.
+// The backend the pane is currently pointed at, and the folder last asked for.
+// Both are per-process, and a process is per-conversation — so a second
+// conversation starts blank even though a backend is very much running.
 let BACKEND = null;
+let LAST_PROJECT_ROOT = null;
+
+/**
+ * Point BACKEND at a live instance when we don't already have one.
+ *
+ * Needed because the pane can be rendered without a launch having happened in
+ * THIS process: the widget is attached to the tool definition, so the host
+ * renders it even when the call returned the shutdown question — and a new
+ * conversation gets a fresh process with no memory of the backend it should be
+ * talking to. Without this, the pane loads and every request fails with
+ * "no backend running" (which surfaces as "Failed to load home directory").
+ *
+ * Prefers an instance serving the folder we were last asked about, then the
+ * highest port, which is the most recently started.
+ */
+async function adoptBackend() {
+  const running = await discover();
+  if (!running.length) return null;
+  const match = LAST_PROJECT_ROOT && running.find((i) => sameFolder(i.folder, LAST_PROJECT_ROOT));
+  const pick = match || running.sort((a, b) => b.port - a.port)[0];
+  BACKEND = `http://127.0.0.1:${pick.port}`;
+  return pick;
+}
 
 // --- tool definitions ---------------------------------------------------------
 const OPEN_TOOL = {
@@ -139,17 +164,22 @@ async function openVibeFoundry(args) {
     );
   }
 
+  LAST_PROJECT_ROOT = projectRoot;
   const running = await discover();
   const decided = args && Object.prototype.hasOwnProperty.call(args, "shutdown_existing");
 
   // First call with instances already up: ask, do not act. The user gets to
   // decide whether their running work is disposable.
   if (running.length > 0 && !decided) {
+    // The host renders the pane off the tool definition, so it appears even for
+    // this question. Point it at a live backend now, or it loads into a dead
+    // relay and every call fails while the user is deciding.
+    await adoptBackend();
     return textResult(
       `It looks like you've got ${plural(running.length, "VibeFoundry assistant")} running:\n` +
         describe(running) +
         `\n\nWant me to shut them down before launching this one?`,
-      { status: "confirm_shutdown", instances: running }
+      { status: "confirm_shutdown", instances: running, backendUrl: BACKEND }
     );
   }
 
@@ -200,6 +230,9 @@ function textResult(text, structured) {
 
 // --- vf_request ---------------------------------------------------------------
 async function proxy(args) {
+  // Self-heal rather than fail: the pane can be alive in a process that never
+  // launched anything. See adoptBackend.
+  if (!BACKEND) await adoptBackend();
   if (!BACKEND) throw new Error("No VibeFoundry backend is running — call open_vibefoundry first.");
 
   const path = String((args && args.path) || "");
@@ -207,12 +240,62 @@ async function proxy(args) {
   const method = String((args && args.method) || "GET").toUpperCase();
 
   const init = { method, headers: {} };
-  if (args && args.body !== undefined && args.body !== null && method !== "GET" && method !== "HEAD") {
+
+  if (args && Array.isArray(args.multipart)) {
+    // A file upload. The pane cannot post FormData through a JSON-RPC call, so
+    // it sends the parts with file content base64'd and we rebuild the real
+    // multipart body here — the backend sees an ordinary browser upload.
+    const boundary = "----vfBoundary" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+    const chunks = [];
+    for (const part of args.multipart) {
+      let head = `--${boundary}\r\nContent-Disposition: form-data; name="${part.name}"`;
+      if (part.filename) head += `; filename="${part.filename}"`;
+      head += "\r\n";
+      if (part.filename) head += `Content-Type: ${part.contentType || "application/octet-stream"}\r\n`;
+      head += "\r\n";
+      chunks.push(Buffer.from(head, "utf8"));
+      chunks.push(
+        part.base64 !== undefined
+          ? Buffer.from(part.base64, "base64")
+          : Buffer.from(String(part.value ?? ""), "utf8")
+      );
+      chunks.push(Buffer.from("\r\n", "utf8"));
+    }
+    chunks.push(Buffer.from(`--${boundary}--\r\n`, "utf8"));
+    init.headers["Content-Type"] = `multipart/form-data; boundary=${boundary}`;
+    init.body = Buffer.concat(chunks);
+  } else if (args && args.body !== undefined && args.body !== null && method !== "GET" && method !== "HEAD") {
     init.headers["Content-Type"] = "application/json";
     init.body = typeof args.body === "string" ? args.body : JSON.stringify(args.body);
   }
 
-  const res = await fetch(BACKEND + path, init);
+  let res;
+  try {
+    res = await fetch(BACKEND + path, init);
+  } catch (e) {
+    // The backend we were pointed at is gone (its terminal was closed). Look for
+    // another before giving up, so one stale pointer doesn't kill the pane.
+    const adopted = await adoptBackend();
+    if (!adopted) throw new Error("The VibeFoundry backend is no longer running.");
+    res = await fetch(BACKEND + path, init);
+  }
+  const ctype = res.headers.get("content-type") || "";
+
+  // Binary (images, PDFs) cannot survive being read as text, and the sandbox
+  // will not let the pane load <img src="/api/image"> directly anyway. Send it
+  // base64 so the pane can build a data: URL.
+  if (!/^(text\/|application\/json|application\/xml)/i.test(ctype) && ctype !== "") {
+    const buf = Buffer.from(await res.arrayBuffer());
+    return {
+      content: [{ type: "text", text: `${ctype}, ${buf.length} bytes` }],
+      structuredContent: {
+        status: res.status,
+        contentType: ctype,
+        base64: buf.toString("base64"),
+      },
+    };
+  }
+
   const text = await res.text();
 
   // Hand back parsed JSON when it is JSON, raw text otherwise. The pane's fetch
@@ -304,6 +387,9 @@ async function handle(msg) {
 
     case "resources/read": {
       if (params.uri !== WIDGET_URI) return rpcError(id, -32602, "Unknown resource: " + params.uri);
+      // The CSP below has to name a real backend, and this can be read before
+      // any launch happened in this process.
+      if (!BACKEND) await adoptBackend();
       const html = await loadPane();
       if (!html) {
         return rpcError(id, -32603, "Could not read the pane bundle. Is `vibefoundry` 0.3.1 or newer installed?");

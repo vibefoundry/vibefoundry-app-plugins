@@ -79,9 +79,23 @@ function check(label, ok, detail) {
   const unknown = await call("tools/call", { name: "no_such_tool", arguments: {} });
   check("unknown tool returns an error", !!unknown.error);
 
-  console.log("\nvf_request before any backend");
+  // A pane can be rendered in a process that never launched anything — a second
+  // conversation, or the shutdown-question result. So with an instance running,
+  // vf_request must adopt it rather than refuse; with none, it must say so
+  // clearly. Which case we're in depends on the machine, so assert accordingly.
+  console.log("\nvf_request with no launch in this process");
+  const { discover } = require("./instances");
+  const alreadyRunning = await discover();
   const early = await call("tools/call", { name: "vf_request", arguments: { path: "/api/health" } });
-  check("refuses with a clear message", early.result?.isError === true, early.result?.content?.[0]?.text);
+  if (alreadyRunning.length) {
+    check(
+      "adopts an already-running backend instead of refusing",
+      early.result?.isError !== true && early.result?.structuredContent?.json?.status === "ok",
+      `${alreadyRunning.length} running, adopted port ${alreadyRunning.map((i) => i.port).join("/")}`
+    );
+  } else {
+    check("refuses with a clear message", early.result?.isError === true, early.result?.content?.[0]?.text);
+  }
 
   if (doLaunch) {
     console.log(`\nopen_vibefoundry on ${folder}  (opens a terminal window)`);
