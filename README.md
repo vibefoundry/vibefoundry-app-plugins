@@ -44,23 +44,41 @@ Two consequences worth knowing:
 
 ## Install
 
-```bash
-node server/register.js      # adds [mcp_servers.vibefoundry] to ~/.codex/config.toml
+This repo **is** a Codex marketplace. Add it as a git source and Codex clones and
+wires it up itself — no path on your disk to point at, and updates come from
+`git pull`:
+
+```
+https://github.com/vibefoundry/vibefoundry-app-plugins.git
 ```
 
 Restart the desktop app, then say **"open VibeFoundry"**.
 
-To remove it:
+### Why it can't be a hosted HTTPS server
+
+MCP tools run where the server runs. This one opens a terminal window on your
+machine, scans your loopback for running instances, and proxies to
+`127.0.0.1` — a hosted server would do all three against its own box, not
+yours. A remote server can serve the pane HTML, but every call the pane makes
+routes back through `vf_request`, which would have no route to your backend: the
+pane would render and stay empty.
+
+A hosted server *could* launch the IDE by handing Codex a command to run — but
+then it opens in a browser window, not a pane. Pane and hosted are mutually
+exclusive.
+
+### Local install, for development
 
 ```bash
-node server/register.js --remove
+node plugins/vibefoundry/server/register.js            # add to ~/.codex/config.toml
+node plugins/vibefoundry/server/register.js --remove   # take it out
 ```
 
 ## Testing without the app
 
 ```bash
-node server/selftest.js <folder>            # protocol only, no side effects
-node server/selftest.js <folder> --launch   # also opens a terminal, end to end
+node plugins/vibefoundry/server/selftest.js <folder>            # protocol only
+node plugins/vibefoundry/server/selftest.js <folder> --launch   # end to end
 ```
 
 It drives the server over real stdio JSON-RPC, so a pass means the protocol
@@ -70,11 +88,14 @@ works — not just that the functions do.
 
 | File | Role |
 |---|---|
-| `server/index.js` | the MCP server: JSON-RPC, tools, the pane resource |
-| `server/launch.js` | opening a terminal and waiting for the backend to appear |
-| `server/instances.js` | finding and stopping running instances |
-| `server/register.js` | writing the `~/.codex/config.toml` block |
-| `server/selftest.js` | end-to-end harness |
+| `.agents/plugins/marketplace.json` | makes this repo a marketplace Codex can add by URL |
+| `plugins/vibefoundry/.codex-plugin/plugin.json` | the plugin manifest |
+| `plugins/vibefoundry/.mcp.json` | declares the local stdio server |
+| `plugins/vibefoundry/server/index.js` | the MCP server: JSON-RPC, tools, the pane resource |
+| `plugins/vibefoundry/server/launch.js` | opening a terminal and waiting for the backend |
+| `plugins/vibefoundry/server/instances.js` | finding and stopping running instances |
+| `plugins/vibefoundry/server/register.js` | local install, for development |
+| `plugins/vibefoundry/server/selftest.js` | end-to-end harness |
 
 ## Tools
 
