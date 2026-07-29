@@ -229,7 +229,60 @@ function textResult(text, structured) {
 }
 
 // --- vf_request ---------------------------------------------------------------
+// Uploads arrive in pieces. A file sent as one base64 string crosses the host
+// bridge as a single enormous JSON value, and a large enough one aborts V8 and
+// takes the whole desktop app down with it — which is exactly what happened the
+// first time "Add data" worked. Buffering chunks here keeps every message small.
+const UPLOADS = new Map();
+const MAX_UPLOAD_BYTES = 200 * 1024 * 1024;
+
+function uploadChunk(spec) {
+  const id = String(spec.id || "");
+  if (!id) throw new Error("upload chunk is missing an id");
+
+  if (spec.abort) {
+    UPLOADS.delete(id);
+    return { content: [{ type: "text", text: "upload discarded" }], structuredContent: { status: 200 } };
+  }
+
+  let entry = UPLOADS.get(id);
+  if (!entry) {
+    entry = { chunks: [], bytes: 0 };
+    UPLOADS.set(id, entry);
+  }
+
+  if (spec.base64) {
+    const buf = Buffer.from(spec.base64, "base64");
+    entry.bytes += buf.length;
+    if (entry.bytes > MAX_UPLOAD_BYTES) {
+      UPLOADS.delete(id);
+      throw new Error(
+        `That file is larger than ${Math.round(MAX_UPLOAD_BYTES / 1048576)}MB. ` +
+          "Copy it into the folder directly instead — the pane relays uploads through " +
+          "the host bridge, which is not built for files this size."
+      );
+    }
+    entry.chunks.push(buf);
+  }
+
+  return {
+    content: [{ type: "text", text: `received ${entry.bytes} bytes` }],
+    structuredContent: { status: 200, json: { received: entry.bytes } },
+  };
+}
+
+function takeUpload(id) {
+  const entry = UPLOADS.get(id);
+  if (!entry) return null;
+  UPLOADS.delete(id);
+  return Buffer.concat(entry.chunks);
+}
+
 async function proxy(args) {
+  // Upload chunks never reach the backend; they accumulate until the request
+  // that references them arrives.
+  if (args && args.upload) return uploadChunk(args.upload);
+
   // Self-heal rather than fail: the pane can be alive in a process that never
   // launched anything. See adoptBackend.
   if (!BACKEND) await adoptBackend();
@@ -254,11 +307,18 @@ async function proxy(args) {
       if (part.filename) head += `Content-Type: ${part.contentType || "application/octet-stream"}\r\n`;
       head += "\r\n";
       chunks.push(Buffer.from(head, "utf8"));
-      chunks.push(
-        part.base64 !== undefined
-          ? Buffer.from(part.base64, "base64")
-          : Buffer.from(String(part.value ?? ""), "utf8")
-      );
+
+      let body;
+      if (part.uploadId !== undefined) {
+        // Assembled from the chunks streamed in ahead of this request.
+        body = takeUpload(String(part.uploadId));
+        if (body === null) throw new Error("the upload expired before it was sent; try again");
+      } else if (part.base64 !== undefined) {
+        body = Buffer.from(part.base64, "base64");
+      } else {
+        body = Buffer.from(String(part.value ?? ""), "utf8");
+      }
+      chunks.push(body);
       chunks.push(Buffer.from("\r\n", "utf8"));
     }
     chunks.push(Buffer.from(`--${boundary}--\r\n`, "utf8"));
