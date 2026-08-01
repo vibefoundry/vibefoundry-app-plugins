@@ -308,7 +308,11 @@ function check(label, ok, detail) {
     const lc = path.join(folder, ".claude", "launch.json");
     let entry = null;
     try { entry = JSON.parse(require("fs").readFileSync(lc, "utf8")).configurations.find((x) => x.name === csc.previewConfigName); } catch { /* read below */ }
-    check("launch.json has the attach-only config", !!entry && entry.url === `http://localhost:${adoptable.port}` && !entry.command && !entry.runtimeExecutable, JSON.stringify(entry));
+    check(
+      "launch.json has the attach-only config with the pane marker",
+      !!entry && entry.url === `http://localhost:${adoptable.port}/?pane=1` && !entry.command && !entry.runtimeExecutable,
+      JSON.stringify(entry)
+    );
   } else {
     console.log("  (no backend running on this folder — claude open/launch.json checks need one; skipped)");
   }
