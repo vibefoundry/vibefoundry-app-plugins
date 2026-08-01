@@ -1,6 +1,6 @@
 {
   "name": "vibefoundry",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Opens the VibeFoundry data-science IDE as a pane, by launching it in a terminal exactly as you would yourself.",
   "author": {
     "name": "VibeFoundry",

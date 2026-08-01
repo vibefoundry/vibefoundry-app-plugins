@@ -61,15 +61,6 @@ async function firstWorking(candidates, args) {
   return null;
 }
 
-/** The pip serving this machine: our conda's if present, else any on PATH. */
-async function findPip() {
-  const found = await firstWorking([PIP], ["--version"]);
-  if (found) return found.cmd;
-  const probe = await shell("pip3 --version || pip --version");
-  if (probe.ok) return probe.out.startsWith("pip") ? (WIN ? "pip" : "pip3") : null;
-  return null;
-}
-
 async function download(url, dest) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`download failed: HTTP ${res.status} for ${url}`);
@@ -122,10 +113,14 @@ async function runSetup({ dryRun = false, progress = () => {} } = {}) {
   };
 
   // -- 1. Python ---------------------------------------------------------------
+  // ALWAYS Miniconda, never an adopted system Python. The first fresh-Mac test
+  // proved why: "any pip on PATH" grabbed Apple's ancient system Python 3.9,
+  // whose --user installs land in ~/Library/Python/3.9/bin — on nobody's PATH —
+  // and Miniconda (and with it the PATH wiring) never installed. One known
+  // environment on every machine is the whole point of a managed setup.
   progress("checking for Python…");
-  let pip = await findPip();
-  if (pip) {
-    step("python", "skipped", `already present (${pip})`);
+  if (fs.existsSync(PIP)) {
+    step("python", "skipped", `already present (${CONDA_DIR})`);
   } else if (dryRun) {
     step("python", "would install", "Miniconda → ~/miniconda3");
   } else {
@@ -135,7 +130,7 @@ async function runSetup({ dryRun = false, progress = () => {} } = {}) {
       await download(minicondaUrl(), installer);
     } catch (e) {
       step("python", "failed", `could not download Miniconda: ${e.message}. ` +
-        "If this network blocks repo.anaconda.com, install Python yourself and re-run setup.");
+        "If this network blocks repo.anaconda.com, install Miniconda yourself and re-run setup.");
       return { ok: false, steps, transcript };
     }
     const res = WIN
@@ -146,10 +141,14 @@ async function runSetup({ dryRun = false, progress = () => {} } = {}) {
       step("python", "failed", `Miniconda installer did not complete: ${res.out.slice(-400)}`);
       return { ok: false, steps, transcript };
     }
-    wireShell(transcript);
-    pip = PIP;
     step("python", "installed", CONDA_DIR);
   }
+
+  // Wire the user's shells UNCONDITIONALLY (not only on fresh installs): the
+  // wiring can be missing even when conda itself is present, and it is exactly
+  // what turns "installed but not runnable" into "runnable".
+  if (!dryRun) wireShell(transcript);
+  const pip = PIP;
 
   // -- 2. Git ------------------------------------------------------------------
   const git = await shell("git --version");

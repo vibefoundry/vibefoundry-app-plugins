@@ -19,7 +19,30 @@
  */
 
 const { execFile, spawn } = require("child_process");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
 const { discover } = require("./instances");
+
+// Where setup installs the runtime. Probed as a fallback whenever the login
+// shell can't see `vibefoundry`: a fresh install is real before the user's
+// shells know about it, and "not on PATH" must not read as "not installed".
+const VF_BIN =
+  process.platform === "win32"
+    ? path.join(os.homedir(), "miniconda3", "Scripts", "vibefoundry.exe")
+    : path.join(os.homedir(), "miniconda3", "bin", "vibefoundry");
+
+/** The command that runs vibefoundry here: the plain name if a login shell
+ * resolves it, else the absolute conda path, else null. */
+async function vfCommand() {
+  const viaShell = await new Promise((resolve) => {
+    const { file, args } = loginShell("vibefoundry --version");
+    execFile(file, args, { timeout: 20000 }, (err) => resolve(!err));
+  });
+  if (viaShell) return "vibefoundry";
+  if (fs.existsSync(VF_BIN)) return VF_BIN;
+  return null;
+}
 
 /** Shell-quote for AppleScript's `do script`, which nests inside a "..." string. */
 function q(s) {
@@ -40,9 +63,12 @@ function loginShell(command) {
 }
 
 /** Ask the installed package where its pane bundle lives. */
-function paneHtmlPath() {
+async function paneHtmlPath() {
+  const cmd = await vfCommand();
+  if (!cmd) return null;
   return new Promise((resolve) => {
-    const { file, args } = loginShell("vibefoundry --pane-path");
+    const { file, args } =
+      cmd === "vibefoundry" ? loginShell("vibefoundry --pane-path") : { file: cmd, args: ["--pane-path"] };
     execFile(file, args, { timeout: 20000 }, (err, out) => {
       const p = String(out || "").trim().split(/\r?\n/).pop();
       resolve(err || !p ? null : p);
@@ -50,10 +76,13 @@ function paneHtmlPath() {
   });
 }
 
-/** Is `vibefoundry` installed and on the user's PATH at all? */
-function isInstalled() {
+/** Is `vibefoundry` installed here at all — on PATH or at the conda path? */
+async function isInstalled() {
+  const cmd = await vfCommand();
+  if (!cmd) return null;
   return new Promise((resolve) => {
-    const { file, args } = loginShell("vibefoundry --version");
+    const { file, args } =
+      cmd === "vibefoundry" ? loginShell("vibefoundry --version") : { file: cmd, args: ["--version"] };
     execFile(file, args, { timeout: 20000 }, (err, out) => {
       resolve(err ? null : String(out || "").trim());
     });
@@ -118,7 +147,12 @@ function openTerminal(cwd, cmd) {
 async function launch(folder, timeoutMs = 45000) {
   const before = new Set((await discover()).map((i) => i.port));
 
-  if (!openTerminal(folder, `vibefoundry --no-browser "${folder}"`)) {
+  // The terminal runs an INTERACTIVE shell, which usually resolves the plain
+  // name — but right after a fresh install the shells may not be wired yet, so
+  // fall back to the absolute path rather than show the user "command not
+  // found" in a window we opened for them.
+  const cmd = (await vfCommand()) || "vibefoundry";
+  if (!openTerminal(folder, `"${cmd}" --no-browser "${folder}"`)) {
     return { ok: false, error: "could not open a terminal window on this platform" };
   }
 

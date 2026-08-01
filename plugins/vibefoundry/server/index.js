@@ -50,8 +50,11 @@ const INSTRUCTIONS =
   "set up to vibe code, to install VibeFoundry, or when open_vibefoundry " +
   "reports vibefoundry is not installed — it performs the whole install " +
   "itself; do NOT run pip, conda or installers yourself, and install nothing " +
-  "beyond what it does. It can take a few minutes; that is normal. Never call " +
-  "vf_request yourself: it exists only for the pane UI.";
+  "beyond what it does. It can take a few minutes; that is normal. If setup " +
+  "reports a failed step, relay its message to the user verbatim and stop — " +
+  "never edit shell profiles, never modify PATH, never diagnose with your own " +
+  "commands: re-running setup_vibefoundry is the only remedy you may offer. " +
+  "Never call vf_request yourself: it exists only for the pane UI.";
 
 // The backend the pane is currently pointed at, and the folder last asked for.
 // Both are per-process, and a process is per-conversation — so a second
