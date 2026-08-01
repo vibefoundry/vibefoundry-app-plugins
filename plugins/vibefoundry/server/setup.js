@@ -3,11 +3,17 @@
  * setup_vibefoundry — install everything the IDE needs, from inside the plugin.
  *
  * This used to live on a hosted server that could only RETURN a script and
- * hope the model ran it faithfully, with a guardrail sermon to keep it from
- * improvising. This runs on the user's machine, so it just does the work:
- * deterministic, narrated, and check-first — every step skips itself when its
- * outcome already exists, which is what makes re-running always safe and what
- * lets a failed run resume instead of starting over.
+ * hope the model ran it faithfully. This runs on the user's machine, so it
+ * just does the work: deterministic, narrated, and check-first — every step
+ * skips itself when its outcome already exists, which is what makes re-running
+ * always safe and what lets an interrupted run resume where it stopped.
+ *
+ * The install is STAGED: each tools/call performs ONE unsatisfied step and
+ * returns, so the model can put a visible status line in the chat between
+ * steps ("Step 2/5 — git: installed") and then call again. Progress inside a
+ * chat message beats progress notifications, which hosts are free to ignore.
+ * The first call installs nothing — it announces the plan, so the user sees
+ * what is about to happen before minutes of downloading start.
  *
  * Two rules the whole file obeys:
  *   - user-space only, never sudo: Miniconda goes to ~/miniconda3, and nothing
@@ -28,19 +34,31 @@ const CONDA_DIR = path.join(HOME, "miniconda3");
 
 // Explicit paths into the conda we install, used instead of PATH: a shell
 // started before the install finished has stale PATH, and chasing that is how
-// installers end in "restart your terminal and try again".
+// installers end in "restart your terminal and try again". ALWAYS Miniconda,
+// never an adopted system Python — the first fresh-Mac test proved why: "any
+// pip on PATH" grabbed Apple's system Python 3.9, whose --user installs land
+// in ~/Library/Python/3.9/bin, on nobody's PATH. One known environment on
+// every machine is the whole point of a managed setup.
 const PIP = WIN ? path.join(CONDA_DIR, "Scripts", "pip.exe") : path.join(CONDA_DIR, "bin", "pip");
 const CONDA = WIN ? path.join(CONDA_DIR, "Scripts", "conda.exe") : path.join(CONDA_DIR, "bin", "conda");
 const PYTHON = WIN ? path.join(CONDA_DIR, "python.exe") : path.join(CONDA_DIR, "bin", "python");
+const VF = WIN ? path.join(CONDA_DIR, "Scripts", "vibefoundry.exe") : path.join(CONDA_DIR, "bin", "vibefoundry");
+
+const DATA_LIBS = ["matplotlib", "plotly", "pandas", "numpy"];
+const PROJECTS_DIR = path.join(HOME, "Documents", "VibeFoundryProjects");
+
+// Per-conversation memory (the server process is per-conversation). `announced`
+// makes the first call a plan, not an install; `vfUpgraded` makes the
+// vibefoundry step "unsatisfied" exactly once per conversation, so every fresh
+// setup run delivers the latest release — re-running setup IS the update
+// channel — without looping forever.
+const state = { announced: false, vfUpgraded: false };
 
 /** Run a command, capturing output; resolves {ok, out} rather than throwing. */
 function run(file, args, timeoutMs = 15 * 60 * 1000) {
   return new Promise((resolve) => {
     execFile(file, args, { timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
-      resolve({
-        ok: !err,
-        out: `${stdout || ""}${stderr || ""}`.trim(),
-      });
+      resolve({ ok: !err, out: `${stdout || ""}${stderr || ""}`.trim() });
     });
   });
 }
@@ -51,22 +69,10 @@ function shell(cmd, timeoutMs = 60 * 1000) {
   return run(process.env.SHELL || "/bin/sh", ["-lc", cmd], timeoutMs);
 }
 
-/** First of `candidates` that exists and answers `--version`-style args. */
-async function firstWorking(candidates, args) {
-  for (const c of candidates) {
-    if (c.includes(path.sep) && !fs.existsSync(c)) continue;
-    const res = await run(c, args, 30 * 1000);
-    if (res.ok) return { cmd: c, out: res.out };
-  }
-  return null;
-}
-
 async function download(url, dest) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`download failed: HTTP ${res.status} for ${url}`);
-  const buf = Buffer.from(await res.arrayBuffer());
-  fs.writeFileSync(dest, buf);
-  return buf.length;
+  fs.writeFileSync(dest, Buffer.from(await res.arrayBuffer()));
 }
 
 function minicondaUrl() {
@@ -77,160 +83,181 @@ function minicondaUrl() {
 
 /**
  * Make sure the shells the user opens can see conda. `conda init` wires the
- * INTERACTIVE shell (.zshrc); the plugin's own probes use a LOGIN shell
+ * INTERACTIVE shell (.zshrc); the launcher's probes use a LOGIN shell
  * (`zsh -lc`), which reads .zprofile instead — so a fresh install can be
  * perfectly healthy yet invisible to `vibefoundry --version`. Guarded one-line
- * additions to both, idempotent by the guard comment.
+ * additions, idempotent by the guard comment. Runs on every completed setup,
+ * not only fresh installs: the wiring can be missing even when conda isn't.
  */
-function wireShell(transcript) {
+function wireShell() {
   if (WIN) return; // the installer's AddToPath registry entry covers Windows
   const line = `\n# added by vibefoundry setup\nexport PATH="$HOME/miniconda3/bin:$PATH"\n`;
   for (const rc of [".zprofile", ".zshrc", ".bash_profile"]) {
     const p = path.join(HOME, rc);
     try {
       const cur = fs.existsSync(p) ? fs.readFileSync(p, "utf8") : "";
-      if (!cur.includes("added by vibefoundry setup")) {
-        fs.appendFileSync(p, line);
-        transcript.push(`wired conda into ~/${rc}`);
-      }
+      if (!cur.includes("added by vibefoundry setup")) fs.appendFileSync(p, line);
     } catch {
       /* an unreadable rc file is not worth failing the install over */
     }
   }
 }
 
-/**
- * The whole install, as a list of check-first steps. Returns a report rather
- * than throwing: a failed step stops the run and says exactly what and why,
- * because "step 2 failed: <stderr>" is actionable and a stack trace is not.
- */
-async function runSetup({ dryRun = false, progress = () => {} } = {}) {
-  const steps = [];
-  const transcript = [];
-  const step = (name, action, detail) => {
-    steps.push({ name, action, detail: detail || "" });
-    progress(`${name}: ${action}${detail ? ` — ${detail}` : ""}`);
-  };
+// --- the five steps -----------------------------------------------------------
+// Each: a fast `check` (is the outcome already there?) and an `install` that
+// returns {ok, detail}. The staged runner performs the FIRST unsatisfied one.
 
-  // -- 1. Python ---------------------------------------------------------------
-  // ALWAYS Miniconda, never an adopted system Python. The first fresh-Mac test
-  // proved why: "any pip on PATH" grabbed Apple's ancient system Python 3.9,
-  // whose --user installs land in ~/Library/Python/3.9/bin — on nobody's PATH —
-  // and Miniconda (and with it the PATH wiring) never installed. One known
-  // environment on every machine is the whole point of a managed setup.
-  progress("checking for Python…");
-  if (fs.existsSync(PIP)) {
-    step("python", "skipped", `already present (${CONDA_DIR})`);
-  } else if (dryRun) {
-    step("python", "would install", "Miniconda → ~/miniconda3");
-  } else {
-    progress("installing Miniconda (~2 min)…");
-    const installer = path.join(os.tmpdir(), WIN ? "vf-miniconda.exe" : "vf-miniconda.sh");
-    try {
-      await download(minicondaUrl(), installer);
-    } catch (e) {
-      step("python", "failed", `could not download Miniconda: ${e.message}. ` +
-        "If this network blocks repo.anaconda.com, install Miniconda yourself and re-run setup.");
-      return { ok: false, steps, transcript };
-    }
-    const res = WIN
-      ? await run(installer, ["/InstallationType=JustMe", "/AddToPath=1", "/S", `/D=${CONDA_DIR}`])
-      : await run("/bin/bash", [installer, "-b", "-p", CONDA_DIR]);
-    try { fs.unlinkSync(installer); } catch { /* temp file; best effort */ }
-    if (!res.ok || !fs.existsSync(PIP)) {
-      step("python", "failed", `Miniconda installer did not complete: ${res.out.slice(-400)}`);
-      return { ok: false, steps, transcript };
-    }
-    step("python", "installed", CONDA_DIR);
-  }
-
-  // Wire the user's shells UNCONDITIONALLY (not only on fresh installs): the
-  // wiring can be missing even when conda itself is present, and it is exactly
-  // what turns "installed but not runnable" into "runnable".
-  if (!dryRun) wireShell(transcript);
-  const pip = PIP;
-
-  // -- 2. Git ------------------------------------------------------------------
-  const git = await shell("git --version");
-  if (git.ok) {
-    step("git", "skipped", git.out.split("\n")[0]);
-  } else if (dryRun) {
-    step("git", "would install", "via conda");
-  } else if (fs.existsSync(CONDA)) {
-    progress("installing git…");
-    const res = await run(CONDA, ["install", "-y", "git"]);
-    step("git", res.ok ? "installed" : "failed", res.ok ? "" : res.out.slice(-400));
-    if (!res.ok) return { ok: false, steps, transcript };
-  } else {
-    // Python pre-existed without conda, so there is no conda to install git
-    // with. Not fatal: git is only used by the IDE's optional `git init`.
-    step("git", "skipped", "no conda to install it with; the IDE works without it");
-  }
-
-  // -- 3. Data libraries -------------------------------------------------------
-  // Install only what's MISSING, never -U: a student with an existing stack
-  // keeps their versions.
-  const py = fs.existsSync(PYTHON) ? PYTHON : WIN ? "python" : "python3";
+async function missingLibs() {
+  if (!fs.existsSync(PYTHON)) return DATA_LIBS.slice();
   const missing = [];
-  for (const lib of ["matplotlib", "plotly", "pandas", "numpy"]) {
-    const probe = await run(py, ["-c", `import ${lib}`], 60 * 1000);
+  for (const lib of DATA_LIBS) {
+    const probe = await run(PYTHON, ["-c", `import ${lib}`], 60 * 1000);
     if (!probe.ok) missing.push(lib);
   }
-  if (!missing.length) {
-    step("data libraries", "skipped", "matplotlib, plotly, pandas, numpy all present");
-  } else if (dryRun) {
-    step("data libraries", "would install", missing.join(", "));
-  } else {
-    progress(`installing ${missing.join(", ")}…`);
-    const res = await run(pip, ["install", ...missing]);
-    step("data libraries", res.ok ? "installed" : "failed", res.ok ? missing.join(", ") : res.out.slice(-400));
-    if (!res.ok) return { ok: false, steps, transcript };
-  }
-
-  // -- 4. VibeFoundry ----------------------------------------------------------
-  // Always -U: re-running setup is how a student receives fixes.
-  if (dryRun) {
-    step("vibefoundry", "would install", "pip install -U vibefoundry");
-  } else {
-    progress("installing/upgrading vibefoundry…");
-    const res = await run(pip, ["install", "-U", "vibefoundry"]);
-    if (!res.ok) {
-      step("vibefoundry", "failed", res.out.slice(-400));
-      return { ok: false, steps, transcript };
-    }
-    step("vibefoundry", "installed", (res.out.match(/vibefoundry-[\d.]+/) || ["latest"])[0]);
-  }
-
-  // -- 5. Projects home --------------------------------------------------------
-  // One empty folder as the suggested place to make projects. Created, never
-  // filled: scaffolding belongs to the Build button and nothing else.
-  const projects = path.join(HOME, "Documents", "VibeFoundryProjects");
-  if (fs.existsSync(projects)) {
-    step("projects home", "skipped", projects);
-  } else if (dryRun) {
-    step("projects home", "would create", projects);
-  } else {
-    fs.mkdirSync(projects, { recursive: true });
-    step("projects home", "created", projects);
-  }
-
-  // -- 6. Verify ---------------------------------------------------------------
-  // The same probes the launcher uses, so setup passing means launch will work.
-  if (!dryRun) {
-    const direct = await firstWorking(
-      [WIN ? path.join(CONDA_DIR, "Scripts", "vibefoundry.exe") : path.join(CONDA_DIR, "bin", "vibefoundry")],
-      ["--version"]
-    );
-    const viaShell = await shell("vibefoundry --version");
-    const version = (direct && direct.out) || (viaShell.ok && viaShell.out) || null;
-    if (!version) {
-      step("verify", "failed", "vibefoundry installed but not runnable — open a new terminal and run `vibefoundry --version`, then re-run setup");
-      return { ok: false, steps, transcript };
-    }
-    step("verify", "ok", version.split("\n").pop());
-  }
-
-  return { ok: true, steps, transcript };
+  return missing;
 }
 
-module.exports = { runSetup };
+const STEPS = [
+  {
+    key: "python",
+    title: "Python (Miniconda)",
+    check: async () => fs.existsSync(PIP),
+    describe: "installs a private Python at ~/miniconda3 — no admin password, nothing system-wide",
+    install: async (progress) => {
+      progress("downloading Miniconda…");
+      const installer = path.join(os.tmpdir(), WIN ? "vf-miniconda.exe" : "vf-miniconda.sh");
+      try {
+        await download(minicondaUrl(), installer);
+      } catch (e) {
+        return {
+          ok: false,
+          detail: `could not download Miniconda: ${e.message}. If this network blocks repo.anaconda.com, install Miniconda yourself and run setup again.`,
+        };
+      }
+      progress("running the Miniconda installer (~2 min)…");
+      const res = WIN
+        ? await run(installer, ["/InstallationType=JustMe", "/AddToPath=1", "/S", `/D=${CONDA_DIR}`])
+        : await run("/bin/bash", [installer, "-b", "-p", CONDA_DIR]);
+      try { fs.unlinkSync(installer); } catch { /* temp file; best effort */ }
+      if (!res.ok || !fs.existsSync(PIP)) {
+        return { ok: false, detail: `Miniconda installer did not complete: ${res.out.slice(-400)}` };
+      }
+      wireShell();
+      return { ok: true, detail: CONDA_DIR };
+    },
+  },
+  {
+    key: "git",
+    title: "Git",
+    check: async () => (await shell("git --version")).ok,
+    describe: "version control, used when projects are built",
+    install: async (progress) => {
+      progress("installing git…");
+      const res = await run(CONDA, ["install", "-y", "git"]);
+      return res.ok ? { ok: true, detail: "" } : { ok: false, detail: res.out.slice(-400) };
+    },
+  },
+  {
+    key: "libs",
+    title: "Data libraries",
+    check: async () => (await missingLibs()).length === 0,
+    describe: "matplotlib, plotly, pandas, numpy — only whichever are missing",
+    install: async (progress) => {
+      const missing = await missingLibs();
+      progress(`installing ${missing.join(", ")}…`);
+      const res = await run(PIP, ["install", ...missing]);
+      return res.ok ? { ok: true, detail: missing.join(", ") } : { ok: false, detail: res.out.slice(-400) };
+    },
+  },
+  {
+    key: "vibefoundry",
+    title: "VibeFoundry",
+    check: async () => state.vfUpgraded,
+    describe: "the IDE itself, always updated to the latest release",
+    install: async (progress) => {
+      progress("installing/updating vibefoundry…");
+      const res = await run(PIP, ["install", "-U", "vibefoundry"]);
+      if (!res.ok) return { ok: false, detail: res.out.slice(-400) };
+      state.vfUpgraded = true;
+      return { ok: true, detail: (res.out.match(/vibefoundry-[\d.]+/) || ["latest"])[0] };
+    },
+  },
+  {
+    key: "home",
+    title: "Projects home",
+    check: async () => fs.existsSync(PROJECTS_DIR),
+    describe: "an empty Documents/VibeFoundryProjects folder to keep projects in",
+    install: async () => {
+      fs.mkdirSync(PROJECTS_DIR, { recursive: true });
+      return { ok: true, detail: PROJECTS_DIR };
+    },
+  },
+];
+
+async function audit() {
+  const out = [];
+  for (const s of STEPS) out.push({ key: s.key, title: s.title, describe: s.describe, satisfied: await s.check() });
+  return out;
+}
+
+/**
+ * Everything installed — prove it with the same probes the launcher uses, so
+ * setup finishing means launch will work.
+ */
+async function verify() {
+  wireShell();
+  const direct = fs.existsSync(VF) ? await run(VF, ["--version"], 30 * 1000) : { ok: false, out: "" };
+  const viaShell = await shell("vibefoundry --version");
+  const version = (direct.ok && direct.out) || (viaShell.ok && viaShell.out) || null;
+  return version ? { ok: true, version: version.split("\n").pop() } : { ok: false };
+}
+
+/**
+ * One tools/call. Returns a phase the caller turns into chat text:
+ *   announce — first call: the plan, nothing installed yet
+ *   step     — one step just ran (ok or not); more remain
+ *   done     — everything satisfied and verified
+ *   failed   — a step or the final verify failed; message says what and why
+ */
+async function setupCall({ dryRun = false, progress = () => {} } = {}) {
+  if (dryRun) {
+    const plan = await audit();
+    return { phase: "dryrun", plan };
+  }
+
+  if (!state.announced) {
+    state.announced = true;
+    const plan = await audit();
+    if (plan.every((s) => s.satisfied)) {
+      const v = await verify();
+      return v.ok
+        ? { phase: "done", version: v.version, installed: [] }
+        : { phase: "failed", step: "verify", detail: "everything is installed but `vibefoundry --version` does not run — run setup again, and if it persists open a new terminal and try the command there" };
+    }
+    return { phase: "announce", plan };
+  }
+
+  const plan = await audit();
+  const next = STEPS.find((s, i) => !plan[i].satisfied);
+  if (next) {
+    const index = STEPS.indexOf(next) + 1;
+    const res = await next.install(progress);
+    if (!res.ok) return { phase: "failed", step: next.title, detail: res.detail };
+    const after = await audit();
+    return {
+      phase: "step",
+      index,
+      total: STEPS.length,
+      title: next.title,
+      detail: res.detail,
+      remaining: STEPS.filter((s, i) => !after[i].satisfied).map((s) => s.title),
+    };
+  }
+
+  const v = await verify();
+  return v.ok
+    ? { phase: "done", version: v.version }
+    : { phase: "failed", step: "verify", detail: "install finished but `vibefoundry --version` does not run — run setup again, and if it persists open a new terminal and try the command there" };
+}
+
+module.exports = { setupCall };

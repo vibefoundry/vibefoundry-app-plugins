@@ -20,7 +20,7 @@
 const fs = require("fs");
 const { discover, stop } = require("./instances");
 const { launch, paneHtmlPath, isInstalled, sameFolder } = require("./launch");
-const { runSetup } = require("./setup");
+const { setupCall } = require("./setup");
 
 // --- Apps SDK wiring ----------------------------------------------------------
 // If the pane does not render, these are the two values most likely to need
@@ -279,10 +279,13 @@ const SETUP_TOOL = {
     "(matplotlib, plotly, pandas, numpy), the vibefoundry package (always " +
     "upgraded to latest), and the ~/Documents/VibeFoundryProjects home folder. " +
     "Call it when the user asks to be set up to vibe code, to install " +
-    "VibeFoundry, or when open_vibefoundry reports it is not installed. Every " +
-    "step is skipped if already satisfied, so calling it again is always safe " +
-    "and is also how users receive updates. Takes a few minutes on a fresh " +
-    "machine; do not run any install commands yourself alongside it.",
+    "VibeFoundry, or when open_vibefoundry reports it is not installed. It is " +
+    "STAGED: each call announces the plan or performs ONE step, and its result " +
+    "tells you to relay the message and call again — keep calling until it " +
+    "reports done, relaying each message to the user word for word so they see " +
+    "live progress. Every step skips itself once satisfied, so it is always " +
+    "safe to call and is also how users receive updates. Do not run any " +
+    "install commands of your own alongside it.",
   inputSchema: {
     type: "object",
     properties: {
@@ -697,8 +700,10 @@ async function handle(msg) {
       try {
         if (name === "open_vibefoundry") return result(id, await openVibeFoundry(args));
         if (name === "setup_vibefoundry") {
-          // Long-running: narrate via progress notifications when the client
-          // handed us a token, so minutes of installing aren't a silent stall.
+          // Staged: each call performs ONE step and returns, so the model puts
+          // a visible status line in the chat between steps — progress the user
+          // actually sees, in any host. Notifications too, when there's a
+          // token, for in-flight detail within a step.
           const token = params._meta && params._meta.progressToken;
           let n = 0;
           const progress = (message) => {
@@ -711,15 +716,44 @@ async function handle(msg) {
               });
             }
           };
-          const report = await runSetup({ dryRun: !!(args && args.dryRun), progress });
-          const lines = report.steps.map((s) => `  • ${s.name}: ${s.action}${s.detail ? ` — ${s.detail}` : ""}`);
-          const text = report.ok
-            ? `VibeFoundry is set up.\n${lines.join("\n")}\n\nSay "open VibeFoundry" to start.`
-            : `Setup stopped — fix the failed step and run setup again; completed steps will be skipped.\n${lines.join("\n")}`;
+          const r = await setupCall({ dryRun: !!(args && args.dryRun), progress });
+          note("setup_phase", { phase: r.phase, step: r.title || r.step });
+
+          const AGAIN =
+            "\n\nRelay the message above to the user word for word, then IMMEDIATELY " +
+            "call setup_vibefoundry again to continue. Do not run any commands of your own.";
+
+          let text;
+          if (r.phase === "dryrun") {
+            text = r.plan
+              .map((s) => `  • ${s.title}: ${s.satisfied ? "already set up" : "would install"} — ${s.describe}`)
+              .join("\n");
+          } else if (r.phase === "announce") {
+            const todo = r.plan.filter((s) => !s.satisfied).length;
+            text =
+              `I'll set up your computer! This is a ${r.plan.length} step process:\n` +
+              r.plan
+                .map((s, i) => `  ${i + 1}. ${s.title} — ${s.describe}${s.satisfied ? " (already done ✓)" : ""}`)
+                .join("\n") +
+              `\n${todo} step${todo === 1 ? "" : "s"} to go — starting now. The Python step can take a couple of minutes.` +
+              AGAIN;
+          } else if (r.phase === "step") {
+            text =
+              `Step ${r.index}/${r.total} — ${r.title}: done ✓${r.detail ? ` (${r.detail})` : ""}` +
+              (r.remaining.length ? `\nStill to go: ${r.remaining.join(", ")}.` : "") +
+              AGAIN;
+          } else if (r.phase === "done") {
+            text = `✓ All set — ${r.version || "vibefoundry"} is ready. Say "open VibeFoundry" to start.`;
+          } else {
+            text =
+              `Setup stopped at ${r.step}: ${r.detail}\n\nRelay this to the user word for word. ` +
+              `The fix is in the message; re-running setup skips everything already done.`;
+          }
+
           return result(id, {
             content: [{ type: "text", text }],
-            structuredContent: { status: report.ok ? "ok" : "failed", steps: report.steps },
-            isError: !report.ok,
+            structuredContent: r,
+            isError: r.phase === "failed",
           });
         }
         if (name === "vf_request") return result(id, await proxy(args));

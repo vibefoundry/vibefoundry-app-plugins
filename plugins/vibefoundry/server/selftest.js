@@ -120,13 +120,26 @@ function check(label, ok, detail) {
   const open = (tools.result?.tools || []).find((t) => t.name === "open_vibefoundry");
   check("open_vibefoundry is linked to the widget", open?._meta?.["openai/outputTemplate"] === "ui://widget/vibefoundry.html");
 
-  // Dry-run only: the real thing installs software, which a selftest must not.
-  // On this machine everything exists, so every step should report skip/would.
-  console.log("\nsetup_vibefoundry (dry run)");
+  // Dry-run + the announce call only: the real steps install software, which a
+  // selftest must not. The announce call is safe by design — the first call
+  // never installs, it states the plan.
+  console.log("\nsetup_vibefoundry (dry run + announce)");
   const setup = await call("tools/call", { name: "setup_vibefoundry", arguments: { dryRun: true } }, 180000);
-  const ssteps = setup.result?.structuredContent?.steps || [];
-  check("reports a step per component", ssteps.length >= 4, ssteps.map((s) => `${s.name}:${s.action}`).join(", "));
-  check("dry run installs nothing", ssteps.every((s) => s.action !== "installed" && s.action !== "created"));
+  const plan = setup.result?.structuredContent?.plan || [];
+  check("dry run reports the full plan", setup.result?.structuredContent?.phase === "dryrun" && plan.length === 5,
+    plan.map((s) => `${s.key}:${s.satisfied ? "ok" : "todo"}`).join(", "));
+
+  const announce = await call("tools/call", { name: "setup_vibefoundry", arguments: {} }, 180000);
+  const asc = announce.result?.structuredContent || {};
+  const atext = announce.result?.content?.[0]?.text || "";
+  if (asc.phase === "announce") {
+    check("first call announces, installs nothing", atext.startsWith("I'll set up your computer!"),
+      atext.split("\n")[0]);
+    check("announce tells the model to relay and call again", /call setup_vibefoundry again/i.test(atext));
+  } else {
+    // A machine with everything satisfied short-circuits to done — also valid.
+    check("first call reports already set up", asc.phase === "done", `phase=${asc.phase}`);
+  }
 
   console.log("\nresources/read (the pane bundle)");
   const res = await call("resources/read", { uri: "ui://widget/vibefoundry.html" });
