@@ -63,17 +63,26 @@ function isInstalled() {
 /** Open a new terminal window running `cmd`, in `cwd`. */
 function openTerminal(cwd, cmd) {
   if (process.platform === "darwin") {
+    // Build the full shell command FIRST — with cwd double-quoted for the
+    // shell — then AppleScript-escape the whole thing once. Escaping the parts
+    // separately left `cd` unquoted, so any folder with a space in it died in
+    // the fresh terminal with "cd: too many arguments".
+    const bash = `cd "${cwd}" && ${cmd}`;
     const script =
       `tell application "Terminal"\n` +
       `  activate\n` +
-      `  do script "cd ${q(cwd)} && ${q(cmd)}"\n` +
+      `  do script "${q(bash)}"\n` +
       `end tell`;
     spawn("osascript", ["-e", script], { stdio: "ignore", detached: true }).unref();
     return true;
   }
 
   if (process.platform === "win32") {
-    spawn(process.env.ComSpec || "cmd.exe", ["/c", `start cmd /k "cd /d ${cwd} && ${cmd}"`], {
+    // `start "" /d "<cwd>"` sets the working directory without a `cd`, which
+    // sidesteps nesting quotes inside quotes — same trick the library's own
+    // /api/terminal/launch uses. The `""` is start's window title slot; without
+    // it, start would eat the quoted path as the title.
+    spawn(process.env.ComSpec || "cmd.exe", ["/c", `start "" /d "${cwd}" cmd /k ${cmd}`], {
       stdio: "ignore",
       detached: true,
       windowsHide: false,
