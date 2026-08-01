@@ -58,7 +58,11 @@ async function writeLaunchConfig(projectRoot, port) {
     if (await portOpen(c.port)) kept.push(c);
   }
 
-  kept.push({ name, url: `http://localhost:${port}`, port });
+  // ?pane=1 is the IDE's explicit "you're embedded" signal. Claude's preview
+  // is a native webview, not an iframe — the app's self!==top detection sees
+  // nothing — so without the marker the pane renders the full browser chrome,
+  // native-terminal buttons and all.
+  kept.push({ name, url: `http://localhost:${port}/?pane=1`, port });
   doc.configurations = kept;
 
   try {
