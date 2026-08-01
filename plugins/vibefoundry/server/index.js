@@ -41,10 +41,13 @@ const INSTRUCTIONS =
   "VibeFoundry opens a local data-science IDE as a pane. Call open_vibefoundry " +
   "whenever the user asks to open, launch, start or show VibeFoundry, the IDE, " +
   "their data workspace or their data pane — immediately, without asking for " +
-  "confirmation, passing the current working directory as projectRoot. If the " +
-  "result asks whether to shut down running instances, relay that question to " +
-  "the user verbatim and call the tool again with shutdown_existing set to their " +
-  "answer. Never call vf_request yourself: it exists only for the pane UI.";
+  "confirmation, passing the ABSOLUTE PATH OF THE CURRENT WORKSPACE as " +
+  "projectRoot. Take that path from context and never guess it, never reuse a " +
+  "path from an earlier conversation, and never substitute the folder some " +
+  "other VibeFoundry instance happens to be running on: the IDE opens exactly " +
+  "the folder you pass. Only set shutdown_existing when the user has explicitly " +
+  "asked to stop instances running on other folders. Never call vf_request " +
+  "yourself: it exists only for the pane UI.";
 
 // The backend the pane is currently pointed at, and the folder last asked for.
 // Both are per-process, and a process is per-conversation — so a second
@@ -52,26 +55,167 @@ const INSTRUCTIONS =
 let BACKEND = null;
 let LAST_PROJECT_ROOT = null;
 
+// What the client told us about itself at initialize, and the workspace roots it
+// reported. See workspaceRoots() for why these matter.
+let CLIENT_INFO = null;
+let CLIENT_CAPS = {};
+let CLIENT_ROOTS = null;
+
+// --- the event log behind the pane's Logs button ------------------------------
+// A ring buffer of what this server actually did — every folder resolution,
+// discovery, launch and relay failure. It exists because the interesting
+// decisions happen in a background process with no console anyone ever sees: the
+// only symptom you get is an IDE showing the wrong project, with nothing to
+// point at. `vf_request /__plugin/log` hands this to the pane.
+const LOG = [];
+const LOG_LIMIT = 300;
+const STARTED_AT = Date.now();
+
+function note(event, detail) {
+  LOG.push({ at: Date.now() - STARTED_AT, event, ...(detail || {}) });
+  if (LOG.length > LOG_LIMIT) LOG.splice(0, LOG.length - LOG_LIMIT);
+}
+
 /**
- * Point BACKEND at a live instance when we don't already have one.
+ * Point BACKEND at the instance serving the folder we were asked for.
  *
  * Needed because the pane can be rendered without a launch having happened in
  * THIS process: the widget is attached to the tool definition, so the host
- * renders it even when the call returned the shutdown question — and a new
- * conversation gets a fresh process with no memory of the backend it should be
- * talking to. Without this, the pane loads and every request fails with
- * "no backend running" (which surfaces as "Failed to load home directory").
+ * renders it on every result — and a new conversation gets a fresh process with
+ * no memory of the backend it should be talking to.
  *
- * Prefers an instance serving the folder we were last asked about, then the
- * highest port, which is the most recently started.
+ * It only ever adopts an instance whose folder MATCHES the one requested.
+ * Adopting "whatever is running" is what made the pane non-deterministic: with
+ * a backend still up on an older project, the pane silently attached to that
+ * one and the IDE opened its folder instead of the folder you asked for. Better
+ * to have no backend and say so than to have the wrong one and look fine.
  */
-async function adoptBackend() {
+async function adoptBackend(folder) {
+  const want = folder || LAST_PROJECT_ROOT;
+  if (!want) return null;
   const running = await discover();
-  if (!running.length) return null;
-  const match = LAST_PROJECT_ROOT && running.find((i) => sameFolder(i.folder, LAST_PROJECT_ROOT));
-  const pick = match || running.sort((a, b) => b.port - a.port)[0];
+  const pick = running.find((i) => sameFolder(i.folder, want));
+  if (!pick) return null;
   BACKEND = `http://127.0.0.1:${pick.port}`;
   return pick;
+}
+
+// --- asking the client where we are -------------------------------------------
+//
+// The folder to open used to come from the model, which meant it came from
+// whatever the model believed about the conversation. MCP has a mechanism for
+// this that does not involve the model at all: the client declares a `roots`
+// capability and answers `roots/list` with the workspace directories. When the
+// host supports it, the answer is authoritative and the model's argument is
+// downgraded to a hint we only fall back on.
+//
+// Requests must not be sent before `notifications/initialized`, so the first
+// fetch is kicked off there.
+
+const pendingRequests = new Map();
+let nextRequestId = 1;
+
+function requestClient(method, params, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    const id = `vf-${nextRequestId++}`; // string ids: cannot collide with the client's
+    const timer = setTimeout(() => {
+      pendingRequests.delete(id);
+      note("client_request_timeout", { method });
+      resolve(null);
+    }, timeoutMs);
+    pendingRequests.set(id, (msg) => {
+      clearTimeout(timer);
+      resolve(msg && msg.error ? null : (msg && msg.result) || null);
+    });
+    send({ jsonrpc: "2.0", id, method, params: params || {} });
+  });
+}
+
+/** True if the message is a reply to something WE asked, not a request to us. */
+function routeClientResponse(msg) {
+  if (!msg || msg.method !== undefined || msg.id === undefined) return false;
+  const waiter = pendingRequests.get(msg.id);
+  if (!waiter) return false;
+  pendingRequests.delete(msg.id);
+  waiter(msg);
+  return true;
+}
+
+/** file:///Users/me/proj -> /Users/me/proj. Non-file roots are not folders. */
+function rootUriToPath(uri) {
+  const s = String(uri || "");
+  if (!s.startsWith("file://")) return null;
+  try {
+    return decodeURIComponent(s.replace(/^file:\/\/(localhost)?/, "")) || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The workspace folders the client is willing to tell us about.
+ *
+ * Cached, and invalidated by notifications/roots/list_changed — the client is
+ * required to send that when they move, so a stale cache cannot outlive a
+ * workspace switch.
+ */
+async function workspaceRoots({ refresh = false } = {}) {
+  if (!refresh && CLIENT_ROOTS) return CLIENT_ROOTS;
+  if (!CLIENT_CAPS || !CLIENT_CAPS.roots) {
+    note("roots_unsupported", { clientCapabilities: Object.keys(CLIENT_CAPS || {}) });
+    CLIENT_ROOTS = [];
+    return CLIENT_ROOTS;
+  }
+  const res = await requestClient("roots/list");
+  const list = (res && Array.isArray(res.roots) ? res.roots : [])
+    .map((r) => rootUriToPath(r && r.uri))
+    .filter(Boolean)
+    .filter((p) => {
+      try {
+        return fs.statSync(p).isDirectory();
+      } catch {
+        return false;
+      }
+    });
+  CLIENT_ROOTS = list;
+  note("roots_listed", { roots: list });
+  return list;
+}
+
+/**
+ * Decide which folder to open, and say why.
+ *
+ * Preference order, strongest evidence first:
+ *   1. a workspace root reported by the client   — no model involved
+ *   2. the projectRoot the model passed          — a hint, and the only tier
+ *                                                  that can be wrong about
+ *                                                  which project you are in
+ * With several roots, the one matching the hint wins; otherwise the first,
+ * which is the workspace the client lists first.
+ */
+async function resolveProjectRoot(hint) {
+  const roots = await workspaceRoots();
+
+  if (roots.length) {
+    const matched = hint && roots.find((r) => sameFolder(r, hint));
+    const chosen = matched || roots[0];
+    note("root_resolved", {
+      source: "client_roots",
+      chosen,
+      hint: hint || null,
+      hintAgrees: !!matched,
+      rootCount: roots.length,
+    });
+    return { path: chosen, source: "client_roots" };
+  }
+
+  if (hint) {
+    note("root_resolved", { source: "model_argument", chosen: hint });
+    return { path: hint, source: "model_argument" };
+  }
+
+  note("root_unresolved", {});
+  return { path: null, source: "none" };
 }
 
 // --- tool definitions ---------------------------------------------------------
@@ -93,15 +237,19 @@ const OPEN_TOOL = {
       projectRoot: {
         type: "string",
         description:
-          "Absolute path to the current working directory. Take this from " +
-          "context; never ask the user for it.",
+          "Absolute path of the CURRENT workspace — the folder this conversation " +
+          "is working in. Take it from context; never ask the user for it, never " +
+          "reuse one from an earlier conversation, and never pass the folder " +
+          "another VibeFoundry instance is running on. Used only when the host " +
+          "does not report a workspace root of its own; when it does, that root " +
+          "wins and this is ignored.",
       },
       shutdown_existing: {
         type: "boolean",
         description:
-          "Only set this after the user has answered the shutdown question this " +
-          "tool asked. true stops the running instances first; false leaves them " +
-          "alone and launches anyway.",
+          "Leave this unset. Only pass true when the user has explicitly asked to " +
+          "stop VibeFoundry instances running on other folders; it stops them all " +
+          "before launching.",
       },
     },
     required: ["projectRoot"],
@@ -139,13 +287,16 @@ function plural(n, word) {
   return `${n} ${word}${n === 1 ? "" : "s"}`;
 }
 
-function describe(list) {
-  return list.map((i) => `  • port ${i.port} — ${i.folder || "no folder"}`).join("\n");
-}
-
 async function openVibeFoundry(args) {
-  const projectRoot = String((args && args.projectRoot) || "").trim();
-  if (!projectRoot) throw new Error("projectRoot is required — pass the current working directory.");
+  const hint = String((args && args.projectRoot) || "").trim() || null;
+  const resolved = await resolveProjectRoot(hint);
+  const projectRoot = resolved.path;
+  if (!projectRoot) {
+    throw new Error(
+      "Could not work out which folder to open: this host reported no workspace " +
+        "root and no projectRoot was passed. Pass the absolute path of the current workspace."
+    );
+  }
 
   let stat;
   try {
@@ -166,25 +317,38 @@ async function openVibeFoundry(args) {
 
   LAST_PROJECT_ROOT = projectRoot;
   const running = await discover();
-  const decided = args && Object.prototype.hasOwnProperty.call(args, "shutdown_existing");
+  const wantsShutdown = !!(args && args.shutdown_existing);
+  note("discovered", { instances: running.map((i) => ({ port: i.port, folder: i.folder })) });
 
-  // First call with instances already up: ask, do not act. The user gets to
-  // decide whether their running work is disposable.
-  if (running.length > 0 && !decided) {
-    // The host renders the pane off the tool definition, so it appears even for
-    // this question. Point it at a live backend now, or it loads into a dead
-    // relay and every call fails while the user is deciding.
-    await adoptBackend();
-    return textResult(
-      `It looks like you've got ${plural(running.length, "VibeFoundry assistant")} running:\n` +
-        describe(running) +
-        `\n\nWant me to shut them down before launching this one?`,
-      { status: "confirm_shutdown", instances: running, backendUrl: BACKEND }
-    );
+  // Already serving this exact folder: attach to it and stop here. Opening the
+  // same project twice should land you in the same place rather than start a
+  // rival backend beside it — which is what makes "open VibeFoundry" idempotent
+  // and what stops a second call from drifting onto a different port.
+  const existing = running.find((i) => sameFolder(i.folder, projectRoot));
+  if (existing && !wantsShutdown) {
+    BACKEND = `http://127.0.0.1:${existing.port}`;
+    note("adopted", { port: existing.port, folder: existing.folder, rootSource: resolved.source });
+    return {
+      content: [{ type: "text", text: `VibeFoundry is open on ${projectRoot}.` }],
+      structuredContent: {
+        status: "ok",
+        backendUrl: BACKEND,
+        port: existing.port,
+        projectFolder: existing.folder,
+        version,
+        stopped: [],
+        adopted: true,
+      },
+      _meta: TOOL_META,
+    };
   }
 
+  // Instances on OTHER folders are left alone unless explicitly asked about.
+  // This used to return a question instead of launching, which put the pane on
+  // screen with nothing behind it — and the pane, having no backend of its own
+  // yet, attached to one of those unrelated instances and opened its project.
   let stopped = [];
-  if (running.length > 0 && args.shutdown_existing) {
+  if (running.length > 0 && wantsShutdown) {
     stopped = await Promise.all(running.map((i) => stop(i.port)));
     const failed = stopped.filter((s) => !s.stopped);
     if (failed.length) {
@@ -197,8 +361,10 @@ async function openVibeFoundry(args) {
     }
   }
 
+  note("launching", { folder: projectRoot, rootSource: resolved.source });
   const result_ = await launch(projectRoot);
   if (!result_.ok) {
+    note("launch_failed", { folder: projectRoot, error: result_.error });
     return textResult(`Could not open VibeFoundry: ${result_.error}`, {
       status: "launch_failed",
       error: result_.error,
@@ -207,11 +373,18 @@ async function openVibeFoundry(args) {
   }
 
   BACKEND = `http://127.0.0.1:${result_.port}`;
+  note("launched", { port: result_.port, folder: result_.folder });
 
   const opened = stopped.filter((s) => s.stopped).length;
-  const note = opened ? ` Stopped ${plural(opened, "previous instance")} first.` : "";
+  const others = wantsShutdown ? 0 : running.length;
+  const suffix = opened
+    ? ` Stopped ${plural(opened, "previous instance")} first.`
+    : others
+      ? ` ${plural(others, "other instance")} still running on ${others === 1 ? "another folder" : "other folders"}` +
+        ` — ask me to shut them down if you want them stopped.`
+      : "";
   return {
-    content: [{ type: "text", text: `VibeFoundry is open on ${projectRoot}.${note}` }],
+    content: [{ type: "text", text: `VibeFoundry is open on ${projectRoot}.${suffix}` }],
     structuredContent: {
       status: "ok",
       backendUrl: BACKEND,
@@ -278,10 +451,49 @@ function takeUpload(id) {
   return Buffer.concat(entry.chunks);
 }
 
+/**
+ * Everything the pane's Logs button needs from this side of the bridge.
+ *
+ * Answered here rather than proxied: it is about the relay itself, and asking
+ * the backend would only ever describe the backend we already picked — which is
+ * useless precisely when picking the wrong one is the bug being chased.
+ */
+function pluginDiagnostics() {
+  return {
+    server: SERVER_INFO,
+    client: CLIENT_INFO,
+    clientCapabilities: Object.keys(CLIENT_CAPS || {}),
+    supportsRoots: !!(CLIENT_CAPS && CLIENT_CAPS.roots),
+    roots: CLIENT_ROOTS,
+    backend: BACKEND,
+    lastProjectRoot: LAST_PROJECT_ROOT,
+    // The spawn context, recorded because it is the fallback we would use if the
+    // host turns out not to support roots — and there is no other way to see it.
+    cwd: process.cwd(),
+    env: Object.fromEntries(
+      Object.entries(process.env).filter(([k]) => /^(CODEX|MCP|WORKSPACE|PROJECT|PWD)/i.test(k))
+    ),
+    node: process.version,
+    platform: process.platform,
+    uptimeMs: Date.now() - STARTED_AT,
+    log: LOG,
+  };
+}
+
 async function proxy(args) {
   // Upload chunks never reach the backend; they accumulate until the request
   // that references them arrives.
   if (args && args.upload) return uploadChunk(args.upload);
+
+  // Answered by the relay, never forwarded. /__plugin/* is this server's own
+  // namespace; the backend has no such routes and never sees these.
+  if (args && String(args.path || "").startsWith("/__plugin/log")) {
+    const diag = pluginDiagnostics();
+    return {
+      content: [{ type: "text", text: `plugin log — ${LOG.length} events` }],
+      structuredContent: { status: 200, json: diag },
+    };
+  }
 
   // Self-heal rather than fail: the pane can be alive in a process that never
   // launched anything. See adoptBackend.
@@ -334,11 +546,16 @@ async function proxy(args) {
     res = await fetch(BACKEND + path, init);
   } catch (e) {
     // The backend we were pointed at is gone (its terminal was closed). Look for
-    // another before giving up, so one stale pointer doesn't kill the pane.
+    // another SERVING THE SAME FOLDER before giving up, so one stale pointer
+    // doesn't kill the pane — and so a healthy instance on some other project
+    // never quietly becomes the one answering.
+    note("relay_failed", { path, method, error: String((e && e.message) || e) });
     const adopted = await adoptBackend();
     if (!adopted) throw new Error("The VibeFoundry backend is no longer running.");
+    note("relay_readopted", { port: adopted.port, folder: adopted.folder });
     res = await fetch(BACKEND + path, init);
   }
+  if (res.status >= 400) note("relay_http_error", { path, method, status: res.status });
   const ctype = res.headers.get("content-type") || "";
 
   // Binary (images, PDFs) cannot survive being read as text, and the sandbox
@@ -402,6 +619,16 @@ async function handle(msg) {
 
   switch (method) {
     case "initialize":
+      // Remember what the client can do. `capabilities.roots` is the one that
+      // decides whether the folder we open is known or merely believed.
+      CLIENT_INFO = params.clientInfo || null;
+      CLIENT_CAPS = params.capabilities || {};
+      note("initialize", {
+        client: CLIENT_INFO,
+        protocolVersion: params.protocolVersion,
+        capabilities: Object.keys(CLIENT_CAPS),
+        supportsRoots: !!CLIENT_CAPS.roots,
+      });
       return result(id, {
         protocolVersion: params.protocolVersion || "2025-06-18",
         capabilities: { tools: {}, resources: {} },
@@ -410,7 +637,18 @@ async function handle(msg) {
       });
 
     case "notifications/initialized":
+      // The first moment the spec allows a server to make requests. Ask now
+      // rather than at open time so the answer is already in hand.
+      workspaceRoots({ refresh: true }).catch(() => {});
       return; // notification: no response
+
+    case "notifications/roots/list_changed":
+      // The workspace moved. Drop the cache so the next open cannot use the old
+      // one — this is the whole reason a cache is safe to keep at all.
+      note("roots_changed", {});
+      CLIENT_ROOTS = null;
+      workspaceRoots({ refresh: true }).catch(() => {});
+      return;
 
     case "ping":
       return result(id, {});
@@ -499,6 +737,11 @@ process.stdin.on("data", (chunk) => {
     } catch {
       continue; // not our framing; ignore rather than crash the session
     }
+    // Replies to roots/list arrive here too — an id and no method. They must be
+    // routed to their waiter, not fed to handle(), which would answer a reply
+    // with "Method not found" and leave the request hanging until it times out.
+    if (routeClientResponse(msg)) continue;
+
     Promise.resolve(handle(msg)).catch((e) => {
       if (msg && msg.id !== undefined) rpcError(msg.id, -32603, String((e && e.message) || e));
     });

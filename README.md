@@ -11,9 +11,47 @@ here, it lives in the library.
 
 Three things:
 
-1. Finds VibeFoundry instances that are already running, and stops them if you say so
+1. Finds VibeFoundry instances that are already running
 2. Opens a **real terminal window** running `vibefoundry --no-browser <cwd>`
 3. Serves the pane, and relays its HTTP calls to that backend
+
+## Where the folder comes from
+
+Two sources, strongest first:
+
+1. **The host's workspace root.** If the client declares a `roots` capability,
+   the server asks it `roots/list` and uses the answer. No model involved, so
+   there is nothing to be wrong about. `notifications/roots/list_changed`
+   invalidates the cache, so a workspace switch cannot be served a stale root.
+2. **The `projectRoot` argument**, used only when the host reports no roots.
+
+That order is the whole point. The argument is the model's recollection of which
+folder the conversation is in; the root is the host stating it. Only the second
+one can be wrong about which project you are in, and it is now the fallback
+rather than the default.
+
+Check which tier is in play with the **Logs** button — it prints
+`supportsRoots` and the roots themselves.
+
+## One folder in, one folder out
+
+Opening VibeFoundry does the same thing every time. Given a folder:
+
+- **already running on that folder** → attach to it
+- **not running on that folder** → open a terminal and launch it there
+
+That is the whole decision. No question to answer, no button to press, no folder
+picker: the folder is settled before the pane appears, so the IDE opens in it.
+
+Instances running on *other* folders are irrelevant to that decision — they are
+mentioned in the reply and otherwise left alone. Pass `shutdown_existing: true`
+to stop them, which only happens when the user asks for it in words.
+
+This is the fix for a real failure: the server used to answer the first call with
+a question instead of launching, and — because the host renders the pane off the
+tool *definition*, question or not — the pane appeared with no backend of its
+own and attached to whichever instance was running. You asked for this folder and
+got whatever project you opened last.
 
 ## The one design rule
 
@@ -30,10 +68,12 @@ browser window would be a second, unwanted one.
 
 Two consequences worth knowing:
 
-- **Every launch creates a new instance.** It never adopts or reuses a running
-  one, even for the same folder — the same as typing the command twice.
-- **Quitting the app leaves the backend running**, in its terminal. Use the
-  shutdown prompt, or `Ctrl+C` in the window.
+- **A launch only happens when nothing is serving that folder yet.** Reusing the
+  running one is what makes opening the same project twice land in the same
+  place; a second backend on the same folder would just be a coin toss over
+  which one the pane got.
+- **Quitting the app leaves the backend running**, in its terminal. Ask to shut
+  it down, or `Ctrl+C` in the window.
 
 ## Requirements
 
@@ -74,6 +114,26 @@ node plugins/vibefoundry/server/register.js            # add to ~/.codex/config.
 node plugins/vibefoundry/server/register.js --remove   # take it out
 ```
 
+## The Logs button
+
+Top right of the IDE, in the pane and in the browser both. It shows the two
+things that matter side by side — the workspace root the host reported, and the
+folder the backend is actually serving — and says so plainly when they disagree.
+Below that is a copyable dump: environment, backend health, every decision this
+relay made, and any UI errors.
+
+The relay half comes from `vf_request /__plugin/log`, which this server answers
+itself instead of forwarding. Asking the backend would only describe the backend
+already chosen, which is no help when choosing the wrong one is the bug. In a
+browser there is no relay, so that half is simply absent.
+
+It also reports `cwd` and any `CODEX_*`/`MCP_*` environment the server was
+spawned with — the raw material for adding a fallback tier if a host ever turns
+up that supports neither roots nor a reliable argument.
+
+Nothing is uploaded or written to disk. It is an in-memory ring buffer that
+leaves the machine only when someone presses Copy.
+
 ## Testing without the app
 
 ```bash
@@ -100,12 +160,19 @@ works — not just that the functions do.
 ## Tools
 
 **`open_vibefoundry(projectRoot, shutdown_existing?)`** — the only tool the model
-should call. On the first call, if instances are already running, it returns a
-question rather than acting; answer it and call again with `shutdown_existing`.
+should call. Always acts, never asks. `projectRoot` is the one input that decides
+the outcome, so the tool description is blunt about it: the current workspace,
+never a path from an earlier conversation, never the folder some other instance
+is on. `shutdown_existing` is opt-in and stops instances on other folders.
 
 **`vf_request({path, method, body})`** — internal plumbing. The pane is a
 sandboxed iframe and cannot reach `127.0.0.1`, so its `fetch` is shimmed to route
 through this. Not for model use.
+
+It relays to the backend for the folder that was asked for, and to no other. If
+there isn't one it refuses, rather than reaching for whatever else is listening —
+a wrong backend answers every call perfectly while showing the wrong project,
+which is far worse than an error.
 
 ## How instances are found
 
@@ -115,7 +182,8 @@ really is one of ours.
 
 There is no registry file. That is deliberate: a registry would only know about
 instances *this server* launched, while the scan also finds the ones you started
-yourself in a terminal — which is exactly what the shutdown prompt should catch.
+yourself in a terminal — so opening a folder you already have running in a
+terminal attaches to it instead of starting a duplicate.
 
 ## Claude Code
 

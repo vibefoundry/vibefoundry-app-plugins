@@ -23,6 +23,13 @@ const child = spawn("node", [path.join(__dirname, "index.js")], {
 
 let buf = "";
 const waiters = new Map();
+
+// The server asks US things too (roots/list), so this harness has to behave like
+// a real client and answer them. Without this the roots path is dead code that
+// times out silently and falls back to the model's argument — which is the exact
+// behaviour it exists to replace.
+const rootsRequests = [];
+let currentRoots = [folder]; // what this fake client answers roots/list with
 child.stdout.setEncoding("utf8");
 child.stdout.on("data", (c) => {
   buf += c;
@@ -33,10 +40,27 @@ child.stdout.on("data", (c) => {
     if (!line) continue;
     let msg;
     try { msg = JSON.parse(line); } catch { continue; }
+
+    if (msg.method === "roots/list") {
+      rootsRequests.push(msg);
+      child.stdin.write(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: msg.id,
+          result: { roots: currentRoots.map((p) => ({ uri: `file://${encodeURI(p)}`, name: "workspace" })) },
+        }) + "\n"
+      );
+      continue;
+    }
+
     const w = waiters.get(msg.id);
     if (w) { waiters.delete(msg.id); w(msg); }
   }
 });
+
+function notify(method, params) {
+  child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method, params: params || {} }) + "\n");
+}
 
 let nextId = 1;
 function call(method, params, timeoutMs = 90000) {
@@ -56,9 +80,26 @@ function check(label, ok, detail) {
 
 (async () => {
   console.log("\ninitialize");
-  const init = await call("initialize", { protocolVersion: "2025-06-18" });
+  const init = await call("initialize", {
+    protocolVersion: "2025-06-18",
+    capabilities: { roots: { listChanged: true } },
+    clientInfo: { name: "vibefoundry-selftest", version: "1.0.0" },
+  });
   check("serverInfo.name is vibefoundry", init.result?.serverInfo?.name === "vibefoundry");
   check("instructions present", typeof init.result?.instructions === "string" && init.result.instructions.length > 50);
+
+  notify("notifications/initialized");
+
+  console.log("\nworkspace roots");
+  // The server asks on initialized; give it a beat to make the round trip.
+  await new Promise((r) => setTimeout(r, 500));
+  check("asked the client for roots/list", rootsRequests.length >= 1, `${rootsRequests.length} request(s)`);
+
+  const diag = await call("tools/call", { name: "vf_request", arguments: { path: "/__plugin/log" } });
+  const d = diag.result?.structuredContent?.json || {};
+  check("sees the client's roots capability", d.supportsRoots === true);
+  check("resolved the root from the client, not the model", Array.isArray(d.roots) && d.roots.length === 1, (d.roots || []).join(", "));
+  check("diagnostics record the spawn context", typeof d.cwd === "string" && Array.isArray(d.log), `cwd=${d.cwd}, ${(d.log || []).length} events`);
 
   console.log("\ntools/list");
   const tools = await call("tools/list", {});
@@ -73,50 +114,92 @@ function check(label, ok, detail) {
   check("returns HTML", typeof html === "string" && html.startsWith("<!doctype html"), html ? `${(html.length / 1024).toFixed(0)} KB` : String(res.error?.message));
   check("is self-contained (no external script src)", typeof html === "string" && !/<script[^>]+src=["']https?:/i.test(html));
 
+  // Withdraw the roots so the model's argument is back in charge — the only
+  // state in which a bad projectRoot can reach the launcher at all. Doing it
+  // this way also proves list_changed really drops the cache: if it did not,
+  // the server would still hold the old root and quietly LAUNCH here rather
+  // than report the bad path, which is how this check turned a read-only run
+  // into one that started a backend and scaffolded a folder.
+  console.log("\nroots/list_changed invalidates the cached root");
+  currentRoots = [];
+  notify("notifications/roots/list_changed");
+  await new Promise((r) => setTimeout(r, 400));
+  const cleared = await call("tools/call", { name: "vf_request", arguments: { path: "/__plugin/log" } });
+  check(
+    "cache dropped when the workspace changed",
+    (cleared.result?.structuredContent?.json?.roots || []).length === 0,
+    JSON.stringify(cleared.result?.structuredContent?.json?.roots)
+  );
+
   console.log("\nbad input is reported, not crashed");
   const bad = await call("tools/call", { name: "open_vibefoundry", arguments: { projectRoot: "/nope/does/not/exist" } });
   check("missing folder returns isError", bad.result?.isError === true, bad.result?.content?.[0]?.text);
+  const none = await call("tools/call", { name: "open_vibefoundry", arguments: {} });
+  check("no root and no argument is reported, not guessed", none.result?.isError === true, none.result?.content?.[0]?.text);
   const unknown = await call("tools/call", { name: "no_such_tool", arguments: {} });
   check("unknown tool returns an error", !!unknown.error);
 
-  // A pane can be rendered in a process that never launched anything — a second
-  // conversation, or the shutdown-question result. So with an instance running,
-  // vf_request must adopt it rather than refuse; with none, it must say so
-  // clearly. Which case we're in depends on the machine, so assert accordingly.
+  // Put the workspace back for the launch section below.
+  currentRoots = [folder];
+  notify("notifications/roots/list_changed");
+  await new Promise((r) => setTimeout(r, 400));
+
+  // The pane can be rendered in a process that never launched anything, and the
+  // relay must NOT go looking for any backend it can find. Attaching to an
+  // unrelated instance is the failure this asserts against: it made the IDE open
+  // whatever folder happened to be running rather than the one asked for. With
+  // no folder established in this process there is no right backend, so the only
+  // correct answer is to refuse — whether or not something is running.
   console.log("\nvf_request with no launch in this process");
   const { discover } = require("./instances");
   const alreadyRunning = await discover();
   const early = await call("tools/call", { name: "vf_request", arguments: { path: "/api/health" } });
-  if (alreadyRunning.length) {
-    check(
-      "adopts an already-running backend instead of refusing",
-      early.result?.isError !== true && early.result?.structuredContent?.json?.status === "ok",
-      `${alreadyRunning.length} running, adopted port ${alreadyRunning.map((i) => i.port).join("/")}`
-    );
-  } else {
-    check("refuses with a clear message", early.result?.isError === true, early.result?.content?.[0]?.text);
-  }
+  check(
+    "refuses rather than adopting an unrelated backend",
+    early.result?.isError === true,
+    alreadyRunning.length
+      ? `${alreadyRunning.length} running (ports ${alreadyRunning.map((i) => i.port).join("/")}) and none adopted`
+      : "nothing running"
+  );
 
   if (doLaunch) {
     console.log(`\nopen_vibefoundry on ${folder}  (opens a terminal window)`);
-    const first = await call("tools/call", { name: "open_vibefoundry", arguments: { projectRoot: folder } });
-    const sc = first.result?.structuredContent || {};
-    console.log(`  -> status=${sc.status}`);
+    // Pass a WRONG projectRoot on purpose. The client reported a root, so the
+    // root must win and this argument must be ignored — that is the difference
+    // between the folder being known and merely believed, and it is the bug the
+    // whole roots path exists to make impossible.
+    const first = await call("tools/call", {
+      name: "open_vibefoundry",
+      arguments: { projectRoot: require("os").homedir() },
+    });
+    const fsc = first.result?.structuredContent || {};
+    console.log(`  -> status=${fsc.status}`);
     console.log(`     ${(first.result?.content?.[0]?.text || "").split("\n").join("\n     ")}`);
 
-    let final = first;
-    if (sc.status === "confirm_shutdown") {
-      check("asks before touching running instances", true, `${sc.instances?.length} running`);
-      console.log("\n  answering: shutdown_existing = false (launch anyway)");
-      final = await call("tools/call", { name: "open_vibefoundry", arguments: { projectRoot: folder, shutdown_existing: false } });
-    }
-
-    const fsc = final.result?.structuredContent || {};
-    check("launched", fsc.status === "ok", fsc.status === "ok" ? `port ${fsc.port}` : fsc.error || fsc.status);
+    check(
+      "opens without asking anything first",
+      fsc.status === "ok",
+      fsc.status === "ok" ? `port ${fsc.port}${fsc.adopted ? " (adopted)" : " (launched)"}` : fsc.error || fsc.status
+    );
 
     if (fsc.status === "ok") {
-      check("pane is linked on the result", final.result?._meta?.["openai/outputTemplate"] === "ui://widget/vibefoundry.html");
-      check("opened the requested folder", String(fsc.projectFolder || "").replace(/^\/private/, "") === folder.replace(/^\/private/, ""), fsc.projectFolder);
+      check("pane is linked on the result", first.result?._meta?.["openai/outputTemplate"] === "ui://widget/vibefoundry.html");
+      check(
+        "opened the client's root, ignoring the wrong projectRoot",
+        String(fsc.projectFolder || "").replace(/^\/private/, "") === folder.replace(/^\/private/, ""),
+        `${fsc.projectFolder} (argument said ${require("os").homedir()})`
+      );
+
+      // The determinism guarantee: asking for the same folder again must land on
+      // the same backend, not start a second one beside it.
+      console.log("\nopen_vibefoundry again on the same folder");
+      const again = await call("tools/call", { name: "open_vibefoundry", arguments: { projectRoot: folder } });
+      const asc = again.result?.structuredContent || {};
+      check(
+        "same folder twice returns the same instance",
+        asc.status === "ok" && asc.port === fsc.port && asc.adopted === true,
+        `port ${asc.port} (first was ${fsc.port}), adopted=${asc.adopted}`
+      );
 
       console.log("\nvf_request against the live backend");
       const health = await call("tools/call", { name: "vf_request", arguments: { path: "/api/health" } });
