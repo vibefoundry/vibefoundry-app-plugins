@@ -152,7 +152,27 @@ async function launch(folder, timeoutMs = 45000) {
   // fall back to the absolute path rather than show the user "command not
   // found" in a window we opened for them.
   const cmd = (await vfCommand()) || "vibefoundry";
-  if (!openTerminal(folder, `"${cmd}" --no-browser "${folder}"`)) {
+
+  // EVERY launch self-checks folder access first, inside the same window —
+  // no extra windows, no cost when granted. On a never-asked macOS account the
+  // ls blocks on the genuine permission dialog at exactly the right moment; on
+  // a denied one it prints the fix in the window and drops a marker so the
+  // 45s timeout below can explain WHY in the chat instead of shrugging.
+  let accessMarker = null;
+  let launchCmd = `"${cmd}" --no-browser "${folder}"`;
+  if (process.platform === "darwin") {
+    accessMarker = path.join(os.tmpdir(), `vf-access-${Date.now()}.txt`);
+    launchCmd =
+      `if ! ls "${folder}" >/dev/null 2>&1; then ` +
+      `echo DENIED > "${accessMarker}"; ` +
+      `echo ""; echo "macOS is blocking Terminal from this folder."; ` +
+      `echo "Fix: System Settings > Privacy & Security > Files and Folders > Terminal > enable Documents Folder"; ` +
+      `echo "(or say \\"set me up to vibe code\\" and setup will re-ask for permission)"; echo ""; ` +
+      `fi; ` +
+      launchCmd;
+  }
+
+  if (!openTerminal(folder, launchCmd)) {
     return { ok: false, error: "could not open a terminal window on this platform" };
   }
 
@@ -164,8 +184,18 @@ async function launch(folder, timeoutMs = 45000) {
     if (fresh) return { ok: true, ...fresh };
   }
 
-  // Distinguish "never started" from "started against the wrong folder", so the
-  // message tells the user something they can act on.
+  // Distinguish the failure modes, so the message tells the user something
+  // they can act on rather than shrugging.
+  if (accessMarker && fs.existsSync(accessMarker)) {
+    try { fs.unlinkSync(accessMarker); } catch { /* best effort */ }
+    return {
+      ok: false,
+      error:
+        "macOS is blocking Terminal from that folder, so the backend cannot start there. " +
+        "Either enable it (System Settings → Privacy & Security → Files and Folders → Terminal → " +
+        "Documents Folder) or run setup_vibefoundry, which will ask for the permission again.",
+    };
+  }
   const now = await discover();
   const strayNew = now.find((i) => !before.has(i.port));
   if (strayNew) {
