@@ -1,9 +1,10 @@
 {
   "mcpServers": {
     "vibefoundry": {
-      "command": "node",
-      "args": ["./server/index.js"],
-      "cwd": "."
+      "command": "./bin/vf",
+      "args": [],
+      "cwd": ".",
+      "tool_timeout_sec": 1800
     }
   }
 }

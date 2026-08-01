@@ -17,7 +17,15 @@ const path = require("path");
 const folder = process.argv[2] || process.cwd();
 const doLaunch = process.argv.includes("--launch");
 
-const child = spawn("node", [path.join(__dirname, "index.js")], {
+// By default this drives the source through node. Set VF_SERVER_CMD to drive a
+// compiled binary instead — the same checks then certify the artifact that
+// actually ships, not just the source it was built from.
+const serverCmd = process.env.VF_SERVER_CMD
+  ? [process.env.VF_SERVER_CMD]
+  : ["node", path.join(__dirname, "index.js")];
+console.log(`server under test: ${serverCmd.join(" ")}`);
+
+const child = spawn(serverCmd[0], serverCmd.slice(1), {
   stdio: ["pipe", "pipe", "inherit"],
 });
 
