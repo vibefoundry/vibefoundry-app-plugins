@@ -729,18 +729,25 @@ async function handle(msg) {
               .map((s) => `  • ${s.title}: ${s.satisfied ? "already set up" : "would install"} — ${s.describe}`)
               .join("\n");
           } else if (r.phase === "announce") {
-            const todo = r.plan.filter((s) => !s.satisfied).length;
+            // Ends by naming what's ABOUT to run: this message is what sits on
+            // screen while the next call installs, so the user always sees
+            // "Installing X…" during the work, not just "X: done" after it.
+            const pending = r.plan.filter((s) => !s.satisfied);
+            const first = pending[0];
             text =
               `I'll set up your computer! This is a ${r.plan.length} step process:\n` +
               r.plan
                 .map((s, i) => `  ${i + 1}. ${s.title} — ${s.describe}${s.satisfied ? " (already done ✓)" : ""}`)
                 .join("\n") +
-              `\n${todo} step${todo === 1 ? "" : "s"} to go — starting now. The Python step can take a couple of minutes.` +
+              `\n${pending.length} step${pending.length === 1 ? "" : "s"} to go.` +
+              `\n\nStarting now: Installing ${first.title}…` +
+              (first.key === "python" ? " (this one takes a couple of minutes)" : "") +
               AGAIN;
           } else if (r.phase === "step") {
+            const next = r.remaining[0];
             text =
               `Step ${r.index}/${r.total} — ${r.title}: done ✓${r.detail ? ` (${r.detail})` : ""}` +
-              (r.remaining.length ? `\nStill to go: ${r.remaining.join(", ")}.` : "") +
+              (next ? `\n\nNow installing: ${next}…` : "") +
               AGAIN;
           } else if (r.phase === "done") {
             text = `✓ All set — ${r.version || "vibefoundry"} is ready. Say "open VibeFoundry" to start.`;
