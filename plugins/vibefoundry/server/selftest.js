@@ -112,9 +112,21 @@ function check(label, ok, detail) {
   console.log("\ntools/list");
   const tools = await call("tools/list", {});
   const names = (tools.result?.tools || []).map((t) => t.name);
-  check("exposes exactly open_vibefoundry + vf_request", names.length === 2 && names.includes("open_vibefoundry") && names.includes("vf_request"), names.join(", "));
+  check(
+    "exposes exactly open_vibefoundry + setup_vibefoundry + vf_request",
+    names.length === 3 && ["open_vibefoundry", "setup_vibefoundry", "vf_request"].every((n) => names.includes(n)),
+    names.join(", ")
+  );
   const open = (tools.result?.tools || []).find((t) => t.name === "open_vibefoundry");
   check("open_vibefoundry is linked to the widget", open?._meta?.["openai/outputTemplate"] === "ui://widget/vibefoundry.html");
+
+  // Dry-run only: the real thing installs software, which a selftest must not.
+  // On this machine everything exists, so every step should report skip/would.
+  console.log("\nsetup_vibefoundry (dry run)");
+  const setup = await call("tools/call", { name: "setup_vibefoundry", arguments: { dryRun: true } }, 180000);
+  const ssteps = setup.result?.structuredContent?.steps || [];
+  check("reports a step per component", ssteps.length >= 4, ssteps.map((s) => `${s.name}:${s.action}`).join(", "));
+  check("dry run installs nothing", ssteps.every((s) => s.action !== "installed" && s.action !== "created"));
 
   console.log("\nresources/read (the pane bundle)");
   const res = await call("resources/read", { uri: "ui://widget/vibefoundry.html" });

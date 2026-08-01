@@ -20,6 +20,7 @@
 const fs = require("fs");
 const { discover, stop } = require("./instances");
 const { launch, paneHtmlPath, isInstalled, sameFolder } = require("./launch");
+const { runSetup } = require("./setup");
 
 // --- Apps SDK wiring ----------------------------------------------------------
 // If the pane does not render, these are the two values most likely to need
@@ -45,9 +46,12 @@ const INSTRUCTIONS =
   "projectRoot. Take that path from context and never guess it, never reuse a " +
   "path from an earlier conversation, and never substitute the folder some " +
   "other VibeFoundry instance happens to be running on: the IDE opens exactly " +
-  "the folder you pass. Only set shutdown_existing when the user has explicitly " +
-  "asked to stop instances running on other folders. Never call vf_request " +
-  "yourself: it exists only for the pane UI.";
+  "the folder you pass. Call setup_vibefoundry whenever the user asks to be " +
+  "set up to vibe code, to install VibeFoundry, or when open_vibefoundry " +
+  "reports vibefoundry is not installed — it performs the whole install " +
+  "itself; do NOT run pip, conda or installers yourself, and install nothing " +
+  "beyond what it does. It can take a few minutes; that is normal. Never call " +
+  "vf_request yourself: it exists only for the pane UI.";
 
 // The backend the pane is currently pointed at, and the folder last asked for.
 // Both are per-process, and a process is per-conversation — so a second
@@ -263,6 +267,33 @@ const OPEN_TOOL = {
   _meta: TOOL_META,
 };
 
+const SETUP_TOOL = {
+  name: "setup_vibefoundry",
+  title: "Set Up VibeFoundry",
+  description:
+    "Installs everything VibeFoundry needs, running the whole install itself: " +
+    "Python (Miniconda, user-space, no admin), git, the core data libraries " +
+    "(matplotlib, plotly, pandas, numpy), the vibefoundry package (always " +
+    "upgraded to latest), and the ~/Documents/VibeFoundryProjects home folder. " +
+    "Call it when the user asks to be set up to vibe code, to install " +
+    "VibeFoundry, or when open_vibefoundry reports it is not installed. Every " +
+    "step is skipped if already satisfied, so calling it again is always safe " +
+    "and is also how users receive updates. Takes a few minutes on a fresh " +
+    "machine; do not run any install commands yourself alongside it.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      dryRun: {
+        type: "boolean",
+        description:
+          "Report what would be installed without installing anything. Only " +
+          "set this if the user asks what setup would do.",
+      },
+    },
+  },
+  annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: true, readOnlyHint: false },
+};
+
 const PROXY_TOOL = {
   name: "vf_request",
   title: "VibeFoundry Backend Request",
@@ -310,8 +341,8 @@ async function openVibeFoundry(args) {
   const version = await isInstalled();
   if (!version) {
     return textResult(
-      "VibeFoundry is not installed, or is not on the PATH of a login shell. " +
-        "Install it with `pip install vibefoundry`, then try again.",
+      "VibeFoundry is not installed on this machine. Call setup_vibefoundry to " +
+        "install it (it handles everything itself), then try again.",
       { status: "not_installed" }
     );
   }
@@ -655,13 +686,39 @@ async function handle(msg) {
       return result(id, {});
 
     case "tools/list":
-      return result(id, { tools: [OPEN_TOOL, PROXY_TOOL] });
+      return result(id, { tools: [OPEN_TOOL, SETUP_TOOL, PROXY_TOOL] });
 
     case "tools/call": {
       const name = params.name;
       const args = params.arguments || {};
       try {
         if (name === "open_vibefoundry") return result(id, await openVibeFoundry(args));
+        if (name === "setup_vibefoundry") {
+          // Long-running: narrate via progress notifications when the client
+          // handed us a token, so minutes of installing aren't a silent stall.
+          const token = params._meta && params._meta.progressToken;
+          let n = 0;
+          const progress = (message) => {
+            note("setup", { message });
+            if (token !== undefined) {
+              send({
+                jsonrpc: "2.0",
+                method: "notifications/progress",
+                params: { progressToken: token, progress: ++n, message },
+              });
+            }
+          };
+          const report = await runSetup({ dryRun: !!(args && args.dryRun), progress });
+          const lines = report.steps.map((s) => `  • ${s.name}: ${s.action}${s.detail ? ` — ${s.detail}` : ""}`);
+          const text = report.ok
+            ? `VibeFoundry is set up.\n${lines.join("\n")}\n\nSay "open VibeFoundry" to start.`
+            : `Setup stopped — fix the failed step and run setup again; completed steps will be skipped.\n${lines.join("\n")}`;
+          return result(id, {
+            content: [{ type: "text", text }],
+            structuredContent: { status: report.ok ? "ok" : "failed", steps: report.steps },
+            isError: !report.ok,
+          });
+        }
         if (name === "vf_request") return result(id, await proxy(args));
         return rpcError(id, -32602, "Unknown tool: " + name);
       } catch (e) {
