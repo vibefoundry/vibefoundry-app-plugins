@@ -767,9 +767,18 @@ async function handle(msg) {
           const r = await setupCall({ dryRun: !!(args && args.dryRun), progress });
           note("setup_phase", { phase: r.phase, step: r.title || r.step });
 
-          const AGAIN =
-            "\n\nRelay the message above to the user word for word, then IMMEDIATELY " +
-            "call setup_vibefoundry again to continue. Do not run any commands of your own.";
+          // The user-facing text is fenced between ⟦ ⟧ and the contract framed
+          // as "your next message must be exactly this" — models obey a
+          // required-output far more reliably than a courtesy "relay this"
+          // before an action they're eager to take, which is how the first
+          // Claude run installed everything in total silence.
+          const speak = (msg, last) =>
+            `⟦${msg}⟧\n\nYour next message to the user must be EXACTLY the text between ⟦ and ⟧ — ` +
+            (last
+              ? "then stop."
+              : "send it BEFORE anything else, then call setup_vibefoundry again to continue. " +
+                "Do not run any commands of your own.");
+          const verb = (title) => (title === "Folder access" ? "Setting up" : "Installing");
 
           let text;
           if (r.phase === "dryrun") {
@@ -782,27 +791,25 @@ async function handle(msg) {
             // "Installing X…" during the work, not just "X: done" after it.
             const pending = r.plan.filter((s) => !s.satisfied);
             const first = pending[0];
-            text =
+            text = speak(
               `I'll set up your computer! This is a ${r.plan.length} step process:\n` +
-              r.plan
-                .map((s, i) => `  ${i + 1}. ${s.title} — ${s.describe}${s.satisfied ? " (already done ✓)" : ""}`)
-                .join("\n") +
-              `\n${pending.length} step${pending.length === 1 ? "" : "s"} to go.` +
-              `\n\nStarting now: Installing ${first.title}…` +
-              (first.key === "python" ? " (this one takes a couple of minutes)" : "") +
-              AGAIN;
+                r.plan
+                  .map((s, i) => `  ${i + 1}. ${s.title} — ${s.describe}${s.satisfied ? " (already done ✓)" : ""}`)
+                  .join("\n") +
+                `\n${pending.length} step${pending.length === 1 ? "" : "s"} to go.` +
+                `\n\n${verb(first.title)} ${first.title} now…` +
+                (first.key === "python" ? " (this one takes a couple of minutes)" : "")
+            );
           } else if (r.phase === "step") {
             const next = r.remaining[0];
-            text =
+            text = speak(
               `Step ${r.index}/${r.total} — ${r.title}: done ✓${r.detail ? ` (${r.detail})` : ""}` +
-              (next ? `\n\nNow installing: ${next}…` : "") +
-              AGAIN;
+                (next ? `\n\n${verb(next)} ${next} now…` : "")
+            );
           } else if (r.phase === "done") {
-            text = `✓ All set — ${r.version || "vibefoundry"} is ready. Say "open VibeFoundry" to start.`;
+            text = speak(`✓ All set — ${r.version || "vibefoundry"} is ready. Say "open VibeFoundry" to start.`, true);
           } else {
-            text =
-              `Setup stopped at ${r.step}: ${r.detail}\n\nRelay this to the user word for word. ` +
-              `The fix is in the message; re-running setup skips everything already done.`;
+            text = speak(`Setup stopped at ${r.step}: ${r.detail}\nThe fix is above — after it, say "set me up" again and I'll pick up where we left off.`, true);
           }
 
           return result(id, {

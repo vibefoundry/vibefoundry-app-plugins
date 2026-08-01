@@ -126,14 +126,14 @@ function check(label, ok, detail) {
   console.log("\nsetup_vibefoundry (dry run + announce)");
   const setup = await call("tools/call", { name: "setup_vibefoundry", arguments: { dryRun: true } }, 180000);
   const plan = setup.result?.structuredContent?.plan || [];
-  check("dry run reports the full plan", setup.result?.structuredContent?.phase === "dryrun" && plan.length === 5,
+  check("dry run reports the full plan", setup.result?.structuredContent?.phase === "dryrun" && plan.length === 6,
     plan.map((s) => `${s.key}:${s.satisfied ? "ok" : "todo"}`).join(", "));
 
   const announce = await call("tools/call", { name: "setup_vibefoundry", arguments: {} }, 180000);
   const asc = announce.result?.structuredContent || {};
   const atext = announce.result?.content?.[0]?.text || "";
   if (asc.phase === "announce") {
-    check("first call announces, installs nothing", atext.startsWith("I'll set up your computer!"),
+    check("first call announces, installs nothing", atext.startsWith("⟦I'll set up your computer!"),
       atext.split("\n")[0]);
     check("announce tells the model to relay and call again", /call setup_vibefoundry again/i.test(atext));
   } else {
