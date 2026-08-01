@@ -293,8 +293,9 @@ async function openVibeFoundry(args) {
   const projectRoot = resolved.path;
   if (!projectRoot) {
     throw new Error(
-      "Could not work out which folder to open: this host reported no workspace " +
-        "root and no projectRoot was passed. Pass the absolute path of the current workspace."
+      "Please Choose A Working Directory First. " +
+        "No workspace folder is selected — relay this warning to the user verbatim, " +
+        "and once they name a folder, call this tool again with it as projectRoot."
     );
   }
 
