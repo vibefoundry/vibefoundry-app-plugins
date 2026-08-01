@@ -21,6 +21,14 @@ const fs = require("fs");
 const { discover, stop } = require("./instances");
 const { launch, paneHtmlPath, isInstalled, sameFolder } = require("./launch");
 const { setupCall } = require("./setup");
+const { writeLaunchConfig } = require("./claude");
+
+/** Which host is on the other end. Decided once, at initialize, from the name
+ * the client gives for itself — the ONLY place the two hosts differ is how the
+ * pane gets on screen, so this is the only switch in the file. */
+function isClaude() {
+  return !!(CLIENT_INFO && /claude/i.test(String(CLIENT_INFO.name || "")));
+}
 
 // --- Apps SDK wiring ----------------------------------------------------------
 // If the pane does not render, these are the two values most likely to need
@@ -55,6 +63,14 @@ const INSTRUCTIONS =
   "never edit shell profiles, never modify PATH, never diagnose with your own " +
   "commands: re-running setup_vibefoundry is the only remedy you may offer. " +
   "Never call vf_request yourself: it exists only for the pane UI.";
+
+// Appended for Claude Code, where the pane is the Preview attaching by config
+// name rather than a widget.
+const CLAUDE_INSTRUCTIONS =
+  " After open_vibefoundry succeeds it returns previewConfigName — immediately " +
+  "call preview_start with that configName to put the IDE pane on screen; the " +
+  "user works in the pane, so do not read or edit the project's files yourself " +
+  "unless they ask you to.";
 
 // The backend the pane is currently pointed at, and the folder last asked for.
 // Both are per-process, and a process is per-conversation — so a second
@@ -366,8 +382,9 @@ async function openVibeFoundry(args) {
   if (existing && !wantsShutdown) {
     BACKEND = `http://127.0.0.1:${existing.port}`;
     note("adopted", { port: existing.port, folder: existing.folder, rootSource: resolved.source });
+    const pane = await paneHandoff(projectRoot, existing.port);
     return {
-      content: [{ type: "text", text: `VibeFoundry is open on ${projectRoot}.` }],
+      content: [{ type: "text", text: `VibeFoundry is open on ${projectRoot}.${pane.text}` }],
       structuredContent: {
         status: "ok",
         backendUrl: BACKEND,
@@ -376,6 +393,7 @@ async function openVibeFoundry(args) {
         version,
         stopped: [],
         adopted: true,
+        ...pane.fields,
       },
       _meta: TOOL_META,
     };
@@ -421,8 +439,9 @@ async function openVibeFoundry(args) {
       ? ` ${plural(others, "other instance")} still running on ${others === 1 ? "another folder" : "other folders"}` +
         ` — ask me to shut them down if you want them stopped.`
       : "";
+  const pane = await paneHandoff(projectRoot, result_.port);
   return {
-    content: [{ type: "text", text: `VibeFoundry is open on ${projectRoot}.${suffix}` }],
+    content: [{ type: "text", text: `VibeFoundry is open on ${projectRoot}.${suffix}${pane.text}` }],
     structuredContent: {
       status: "ok",
       backendUrl: BACKEND,
@@ -430,8 +449,37 @@ async function openVibeFoundry(args) {
       projectFolder: result_.folder,
       version,
       stopped,
+      ...pane.fields,
     },
     _meta: TOOL_META,
+  };
+}
+
+/**
+ * How the pane reaches the screen, per host. On Codex the widget attached to
+ * this tool's definition does it — nothing to add. On Claude the Preview pane
+ * attaches by config name from <project>/.claude/launch.json, so register the
+ * backend there and tell the model exactly what to do next. If the file can't
+ * be written, fall back to naming the URL — a pane the user opens by hand
+ * beats an instruction that silently failed.
+ */
+async function paneHandoff(projectRoot, port) {
+  if (!isClaude()) return { text: "", fields: {} };
+  const name = await writeLaunchConfig(projectRoot, port);
+  note("claude_pane", { config: name, port });
+  if (name) {
+    return {
+      text:
+        ` Now open the pane: call preview_start with configName "${name}" so the ` +
+        `user sees the IDE. Do not browse the project's files yourself — the pane is the view.`,
+      fields: { previewConfigName: name },
+    };
+  }
+  return {
+    text:
+      ` Could not register the Preview config (is the project folder writable?). ` +
+      `Tell the user to open http://127.0.0.1:${port}/ in the preview or a browser.`,
+    fields: { previewConfigName: null },
   };
 }
 
@@ -671,7 +719,7 @@ async function handle(msg) {
         protocolVersion: params.protocolVersion || "2025-06-18",
         capabilities: { tools: {}, resources: {} },
         serverInfo: SERVER_INFO,
-        instructions: INSTRUCTIONS,
+        instructions: INSTRUCTIONS + (isClaude() ? CLAUDE_INSTRUCTIONS : ""),
       });
 
     case "notifications/initialized":

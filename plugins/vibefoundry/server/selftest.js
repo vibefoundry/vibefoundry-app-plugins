@@ -253,6 +253,67 @@ function check(label, ok, detail) {
     console.log("\n(skipping launch — pass --launch to open a terminal and test end to end)");
   }
 
+  // --- second pass: the same server as CLAUDE sees it -------------------------
+  // A fresh process (host is decided once, at initialize), introducing itself
+  // as Claude Code. The only differences allowed are the view layer: Claude
+  // instructions mention preview_start, and — with a backend adoptable — the
+  // open result carries a previewConfigName and a written launch.json.
+  console.log("\nclaude host pass (fresh server, claude clientInfo)");
+  const c = spawn(serverCmd[0], serverCmd.slice(1), { stdio: ["pipe", "pipe", "inherit"] });
+  let cbuf = "";
+  const cwaiters = new Map();
+  c.stdout.setEncoding("utf8");
+  c.stdout.on("data", (chunk) => {
+    cbuf += chunk;
+    let nl;
+    while ((nl = cbuf.indexOf("\n")) !== -1) {
+      const line = cbuf.slice(0, nl).trim();
+      cbuf = cbuf.slice(nl + 1);
+      if (!line) continue;
+      let msg;
+      try { msg = JSON.parse(line); } catch { continue; }
+      if (msg.method === "roots/list") {
+        c.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { roots: currentRoots.map((p) => ({ uri: `file://${encodeURI(p)}`, name: "workspace" })) } }) + "\n");
+        continue;
+      }
+      const w = cwaiters.get(msg.id);
+      if (w) { cwaiters.delete(msg.id); w(msg); }
+    }
+  });
+  let cid = 1000;
+  const ccall = (method, params, timeoutMs = 90000) => {
+    const id = cid++;
+    return new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error(`${method} timed out`)), timeoutMs);
+      cwaiters.set(id, (m) => { clearTimeout(t); resolve(m); });
+      c.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+    });
+  };
+
+  const cinit = await ccall("initialize", {
+    protocolVersion: "2025-06-18",
+    capabilities: { roots: { listChanged: true } },
+    clientInfo: { name: "claude-code", version: "2.0.0" },
+  });
+  check("claude gets the preview_start instructions", /preview_start/.test(cinit.result?.instructions || ""));
+  c.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} }) + "\n");
+  await new Promise((r) => setTimeout(r, 400));
+
+  const { discover: cdiscover } = require("./instances");
+  const adoptable = (await cdiscover()).find((i) => i.folder && i.folder.replace(/^\/private/, "") === folder.replace(/^\/private/, ""));
+  if (adoptable) {
+    const copen = await ccall("tools/call", { name: "open_vibefoundry", arguments: {} });
+    const csc = copen.result?.structuredContent || {};
+    check("claude open returns a previewConfigName", csc.previewConfigName === `vibefoundry-${adoptable.port}`, String(csc.previewConfigName));
+    const lc = path.join(folder, ".claude", "launch.json");
+    let entry = null;
+    try { entry = JSON.parse(require("fs").readFileSync(lc, "utf8")).configurations.find((x) => x.name === csc.previewConfigName); } catch { /* read below */ }
+    check("launch.json has the attach-only config", !!entry && entry.url === `http://localhost:${adoptable.port}` && !entry.command && !entry.runtimeExecutable, JSON.stringify(entry));
+  } else {
+    console.log("  (no backend running on this folder — claude open/launch.json checks need one; skipped)");
+  }
+  c.kill();
+
   console.log(`\n${failures ? `${failures} check(s) failed` : "all checks passed"}\n`);
   child.kill();
   process.exit(failures ? 1 : 0);

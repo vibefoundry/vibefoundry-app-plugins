@@ -1,0 +1,19 @@
+{
+  "name": "vibefoundry",
+  "version": "0.5.0",
+  "description": "Sets up and opens the VibeFoundry data-science IDE as a pane — installs everything it needs itself, then launches it in a terminal exactly as you would yourself.",
+  "author": {
+    "name": "VibeFoundry",
+    "url": "https://vibefoundry.ai"
+  },
+  "homepage": "https://vibefoundry.ai",
+  "repository": "https://github.com/vibefoundry/vibefoundry-app-plugins",
+  "license": "MIT",
+  "keywords": ["data science", "IDE", "analytics"],
+  "mcpServers": {
+    "vibefoundry": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/vf",
+      "args": []
+    }
+  }
+}

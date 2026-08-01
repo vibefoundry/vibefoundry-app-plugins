@@ -199,9 +199,19 @@ terminal attaches to it instead of starting a duplicate.
 
 ## Claude Code
 
-Not wired up yet. The shared core is the same (find instances → open terminal →
-wait for health); only the last step differs. Claude Code's preview reaches
-localhost directly, so it needs no `vf_request` relay and no pane bundle — it
-loads `http://127.0.0.1:PORT/` and the UI detects the iframe and adapts itself.
-The extra piece it needs is writing `.claude/launch.json` with a config named
-per port, so two conversations cannot clobber each other's pane.
+Wired up — same repo, same binaries. `.claude-plugin/` makes this repo a
+Claude Code marketplace too; the plugin manifest points Claude at the same
+`bin/vf` the Codex side runs. The server tells the hosts apart at the
+`initialize` handshake, and the ONLY difference is how the pane reaches the
+screen: Claude's Preview attaches by config name, so on open the server
+registers an attach-only `vibefoundry-<port>` entry in the project's
+`.claude/launch.json` (per port, so two conversations cannot clobber each
+other's pane; attach-only, so the pane never tries to spawn the backend
+itself) and returns `previewConfigName` for the model to hand to
+`preview_start`. No widget, no `vf_request` relay, no pane bundle — Claude's
+preview reaches localhost directly, and the IDE detects it is framed and
+adapts itself.
+
+Install: `/plugin marketplace add vibefoundry/vibefoundry-app-plugins`, then
+install `vibefoundry` from it. Setup and launch are word-for-word the same as
+Codex. See ARCHITECTURE.md for the whole picture.

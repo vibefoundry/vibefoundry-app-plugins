@@ -1,0 +1,20 @@
+{
+  "name": "vibefoundry",
+  "owner": {
+    "name": "VibeFoundry",
+    "email": "angelo@vibefoundry.ai",
+    "url": "https://vibefoundry.ai"
+  },
+  "metadata": {
+    "description": "VibeFoundry — the data-science IDE, set up and launched as an in-app pane.",
+    "version": "0.5.0"
+  },
+  "plugins": [
+    {
+      "name": "vibefoundry",
+      "source": "./plugins/vibefoundry",
+      "description": "Say \"set me up to vibe code\" to install everything, then \"open VibeFoundry\" to launch the IDE as a pane on your current project.",
+      "category": "productivity"
+    }
+  ]
+}
