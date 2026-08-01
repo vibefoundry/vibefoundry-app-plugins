@@ -1,0 +1,10 @@
+#!/bin/sh
+# Entry point on macOS/Linux: pick the binary for this machine's architecture
+# and become it. Windows never runs this file — the extensionless command makes
+# CreateProcess resolve to vf.exe beside it.
+dir="$(cd "$(dirname "$0")" && pwd)"
+case "$(uname -sm)" in
+  "Darwin arm64") exec "$dir/vf-darwin-arm64" "$@" ;;
+  "Darwin x86_64") exec "$dir/vf-darwin-x64" "$@" ;;
+  *) echo "vibefoundry plugin: unsupported platform: $(uname -sm)" >&2; exit 1 ;;
+esac
