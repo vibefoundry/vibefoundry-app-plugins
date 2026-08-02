@@ -149,6 +149,34 @@ function check(label, ok, detail) {
   const setupTool = (tools.result?.tools || []).find((t) => t.name === "setup_vibefoundry");
   check("setup tool is linked to its own widget", setupTool?._meta?.["openai/outputTemplate"] === "ui://widget/vibefoundry-setup.html");
 
+  console.log("\nresources/read (pane on a bare machine — must fall back, never error)");
+  // A fresh child with PATH pointing nowhere useful and HOME moved, so neither
+  // the login shell nor the conda path can find vibefoundry.
+  // Spawn via THIS harness's own interpreter — the stripped PATH is meant to
+  // starve the server's probes, not the spawn itself.
+  const bare = spawn(process.execPath, [path.join(__dirname, "index.js")], {
+    stdio: ["pipe", "pipe", "inherit"],
+    env: { ...process.env, VF_SETUP_NO_WINDOW: "1", PATH: "/usr/bin:/bin", HOME: require("os").tmpdir(), SHELL: "/bin/sh" },
+  });
+  let bbuf = ""; const bwait = new Map();
+  bare.stdout.setEncoding("utf8");
+  bare.stdout.on("data", (ch) => { bbuf += ch; let nl;
+    while ((nl = bbuf.indexOf("\n")) !== -1) { const line = bbuf.slice(0, nl).trim(); bbuf = bbuf.slice(nl + 1);
+      if (!line) continue; let m; try { m = JSON.parse(line); } catch { continue; }
+      if (m.method === "roots/list") { bare.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: m.id, result: { roots: [] } }) + "\n"); continue; }
+      const w = bwait.get(m.id); if (w) { bwait.delete(m.id); w(m); } } });
+  let bid = 5000;
+  const bcall = (method, params) => new Promise((res, rej) => {
+    const id = bid++; const t = setTimeout(() => rej(new Error(method + " timed out")), 30000);
+    bwait.set(id, (m) => { clearTimeout(t); res(m); });
+    bare.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+  });
+  await bcall("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "codex", version: "1" } });
+  const bres = await bcall("resources/read", { uri: "ui://widget/vibefoundry.html" });
+  const bhtml = bres.result?.contents?.[0]?.text || "";
+  check("bare machine gets the fallback card, not an error", !bres.error && bhtml.includes("set me up to vibe code"), bres.error ? bres.error.message : `${(bhtml.length/1024).toFixed(1)} KB`);
+  bare.kill();
+
   console.log("\nresources/read (the pane bundle)");
   const res = await call("resources/read", { uri: "ui://widget/vibefoundry.html" });
   const html = res.result?.contents?.[0]?.text;

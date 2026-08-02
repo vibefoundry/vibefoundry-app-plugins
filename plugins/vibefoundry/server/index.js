@@ -53,12 +53,13 @@ const SETUP_TOOL_META = {
   "openai/outputTemplate": SETUP_WIDGET_URI,
   ui: { resourceUri: SETUP_WIDGET_URI },
 };
-const SETUP_WIDGET_HTML = `<!doctype html><meta charset="utf-8"><title>VibeFoundry Setup</title>
+function embeddedCard(initialSub) {
+  return `<!doctype html><meta charset="utf-8"><title>VibeFoundry Setup</title>
 <body style="margin:0;font-family:ui-sans-serif,-apple-system,system-ui;background:#fff;color:#0d0d0d">
 <div style="padding:18px 22px">
 <div style="font-size:30px;font-weight:800;color:#2070e8;letter-spacing:-1.5px">vf</div>
 <div style="font-size:15px;font-weight:600;margin:4px 0 2px">Setting up your computer</div>
-<div id="sub" style="font-size:12px;color:#5d5d5d;margin-bottom:10px">preparing…</div>
+<div id="sub" style="font-size:12px;color:#5d5d5d;margin-bottom:10px">${initialSub}</div>
 <div id="steps"></div>
 <div id="msg" style="font-size:12px;color:#5d5d5d;margin-top:8px;min-height:16px"></div>
 </div>
@@ -89,6 +90,13 @@ async function tick(){
 }
 if (window.openai && window.openai.callTool) tick(); else document.getElementById('sub').textContent='waiting for host…';
 </script></body>`;
+}
+const SETUP_WIDGET_HTML = embeddedCard("preparing…");
+// Served when the IDE pane is asked for on a machine with no package yet:
+// friendly, and it turns into the live progress card the moment setup runs.
+const PANE_FALLBACK_HTML = embeddedCard(
+  "VibeFoundry isn't installed on this computer yet — say \"set me up to vibe code\" in the chat."
+);
 
 const SERVER_INFO = { name: "vibefoundry", version: "0.1.0" };
 
@@ -938,9 +946,15 @@ async function handle(msg) {
       // The CSP below has to name a real backend, and this can be read before
       // any launch happened in this process.
       if (!BACKEND) await adoptBackend();
-      const html = await loadPane();
+      let html = await loadPane();
       if (!html) {
-        return rpcError(id, -32603, "Could not read the pane bundle. Is `vibefoundry` 0.3.1 or newer installed?");
+        // NEVER an error: the host renders this widget off tool results even
+        // when the result was "not installed", and a red error box is a rotten
+        // first impression. Serve the embedded card instead — it invites setup
+        // and shows live progress once setup runs. The real pane serves on the
+        // next read after install (only successes are cached).
+        note("pane_fallback_served", {});
+        html = PANE_FALLBACK_HTML;
       }
       return result(id, {
         contents: [
