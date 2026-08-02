@@ -20,8 +20,8 @@
 const fs = require("fs");
 const { discover, stop } = require("./instances");
 const { launch, paneHtmlPath, isInstalled, sameFolder } = require("./launch");
-const { setupCall } = require("./setup");
-const { writeLaunchConfig } = require("./claude");
+const { setupCall, getProgressState } = require("./setup");
+const { writeLaunchConfig, startProgressServer } = require("./claude");
 
 /** Which host is on the other end. Decided once, at initialize, from the name
  * the client gives for itself — the ONLY place the two hosts differ is how the
@@ -314,6 +314,9 @@ const SETUP_TOOL = {
     },
   },
   annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: true, readOnlyHint: false },
+  // The widget doubles as the setup progress card on Codex: the host renders
+  // it automatically off every staged result — deterministic, in-app, no model.
+  _meta: TOOL_META,
 };
 
 const PROXY_TOOL = {
@@ -586,6 +589,13 @@ async function proxy(args) {
 
   // Answered by the relay, never forwarded. /__plugin/* is this server's own
   // namespace; the backend has no such routes and never sees these.
+  if (args && String(args.path || "").startsWith("/__plugin/setup-state")) {
+    return {
+      content: [{ type: "text", text: "setup state" }],
+      structuredContent: { status: 200, json: getProgressState() },
+    };
+  }
+
   if (args && String(args.path || "").startsWith("/__plugin/log")) {
     const diag = pluginDiagnostics();
     return {
@@ -780,6 +790,20 @@ async function handle(msg) {
           const r = await setupCall({ dryRun: !!(args && args.dryRun), progress });
           note("setup_phase", { phase: r.phase, step: r.title || r.step });
 
+          // Claude has no widget, but the plugin can SERVE the progress display
+          // itself and register it as a preview — in-app, live, model-free
+          // after the one preview_start. Codex needs none of this: the widget
+          // on this tool renders the same card automatically.
+          let setupPane = null;
+          if (isClaude() && r.phase === "announce") {
+            const pport = await startProgressServer(getProgressState);
+            const roots = await workspaceRoots();
+            if (pport && roots.length) {
+              setupPane = await writeLaunchConfig(roots[0], pport, "vibefoundry-setup");
+            }
+            note("claude_setup_pane", { port: pport, config: setupPane });
+          }
+
           // The user-facing text is fenced between ⟦ ⟧ and the contract framed
           // as "your next message must be exactly this" — models obey a
           // required-output far more reliably than a courtesy "relay this"
@@ -813,6 +837,9 @@ async function handle(msg) {
                 `\n\n${verb(first.title)} ${first.title} now…` +
                 (first.key === "python" ? " (this one takes a couple of minutes)" : "")
             );
+            if (setupPane) {
+              text += ` Also call preview_start with configName "${setupPane}" so the user can watch the install live.`;
+            }
           } else if (r.phase === "step") {
             const next = r.remaining[0];
             text = speak(

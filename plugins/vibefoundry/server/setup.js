@@ -27,7 +27,6 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { execFile } = require("child_process");
-const { openTerminal } = require("./launch");
 
 const HOME = os.homedir();
 const WIN = process.platform === "win32";
@@ -53,40 +52,15 @@ const PROJECTS_DIR = path.join(HOME, "Documents", "VibeFoundryProjects");
 // vibefoundry step "unsatisfied" exactly once per conversation, so every fresh
 // setup run delivers the latest release — re-running setup IS the update
 // channel — without looping forever.
-const state = { announced: false, vfUpgraded: false, logFile: null, windowShown: false };
+const state = { announced: false, vfUpgraded: false };
 
-// --- the deterministic progress display ----------------------------------------
-// The chat cannot be trusted with progress: only the model can put words there,
-// and models chain tool calls in silence (observed twice). So setup shows its
-// work on a surface OUR code owns — a real terminal window tailing a log this
-// process writes. Announce and act are adjacent lines of the same code path:
-// "Installing Miniconda…" appears BECAUSE the install is about to run, with no
-// model, host, or instruction in between. Chat narration remains a bonus.
-function logLine(text) {
-  if (!state.logFile) return;
-  try { fs.appendFileSync(state.logFile, text + "\n"); } catch { /* display only */ }
-}
-
-function ensureProgressWindow() {
-  if (state.windowShown || process.env.VF_SETUP_NO_WINDOW) return;
-  state.windowShown = true;
-  state.logFile = path.join(os.tmpdir(), `vibefoundry-setup-${Date.now()}.log`);
-  try {
-    fs.writeFileSync(
-      state.logFile,
-      "==============================\n" +
-        "  VibeFoundry Setup\n" +
-        "==============================\n\n"
-    );
-  } catch {
-    state.logFile = null;
-    return;
-  }
-  const cmd = WIN
-    ? `powershell -NoProfile -Command "Get-Content -Path '${state.logFile}' -Wait"`
-    : `clear; tail -n +1 -f "${state.logFile}"`;
-  openTerminal(HOME, cmd);
-}
+// Live progress snapshot for the IN-APP displays: the Codex widget and the
+// Claude progress page both read this — one via /__plugin/setup-state through
+// the vf_request bridge, one via the plugin's own progress page server. Updated
+// by the same code that performs the steps, so what the user sees is what is
+// happening, with no model or terminal window anywhere in the chain.
+const progressState = { phase: "idle", plan: [], current: null, message: "", version: null, error: null };
+function getProgressState() { return progressState; }
 
 /** Run a command, capturing output; resolves {ok, out} rather than throwing. */
 function run(file, args, timeoutMs = 15 * 60 * 1000) {
@@ -137,45 +111,7 @@ function wireShell() {
   }
 }
 
-// --- macOS folder permission ---------------------------------------------------
-// The backend runs inside Terminal, and macOS gates Terminal's access to
-// Documents per app, per account. Nothing can GRANT that programmatically — by
-// Apple's design, the Allow click is the human's — but setup can make the one
-// click happen at the right moment: probe Terminal's actual access (from a
-// Terminal window, because probing from THIS process would test the host app's
-// permission, not Terminal's), and if the answer was previously denied, reset
-// the recorded verdict (tccutil forgets; it cannot grant) so the genuine macOS
-// dialog reappears — during setup, while the user is watching and expecting to
-// click things, instead of ambushing them at first launch.
-//
-// The probe result is cached per conversation so audits don't spawn a window
-// each time; the step itself runs once per setup and verifies, so the outcome
-// is always a known state: granted, or denied-with-the-exact-fix.
-let tccProbeResult = null;
-
-function probeTerminalDocumentsAccess(timeoutMs = 120 * 1000) {
-  return new Promise((resolve) => {
-    const marker = path.join(os.tmpdir(), `vf-tcc-${Date.now()}.txt`);
-    // ls blocks while the macOS permission dialog is up, so a slow answer is a
-    // user reading the dialog, not a hang — hence the long poll.
-    const cmd = `ls "$HOME/Documents" >/dev/null 2>&1 && echo GRANTED > "${marker}" || echo DENIED > "${marker}"; exit`;
-    if (!openTerminal(os.homedir(), cmd)) return resolve(null);
-    const deadline = Date.now() + timeoutMs;
-    const poll = () => {
-      try {
-        const v = fs.readFileSync(marker, "utf8").trim();
-        try { fs.unlinkSync(marker); } catch { /* best effort */ }
-        return resolve(v === "GRANTED");
-      } catch {
-        if (Date.now() > deadline) return resolve(null);
-        setTimeout(poll, 300);
-      }
-    };
-    poll();
-  });
-}
-
-// --- the six steps -------------------------------------------------------------
+// --- the five steps -------------------------------------------------------------
 // Each: a fast `check` (is the outcome already there?) and an `install` that
 // returns {ok, detail}. The staged runner performs the FIRST unsatisfied one.
 
@@ -190,39 +126,6 @@ async function missingLibs() {
 }
 
 const STEPS = [
-  {
-    // FIRST, deliberately: the permission dialog (when one is needed) appears
-    // while the user is watching the setup start — attentive and ready to
-    // click — not buried behind the two-minute Miniconda download. macOS-only;
-    // elsewhere it self-satisfies.
-    key: "folderAccess",
-    title: "Folder access",
-    check: async () => WIN || tccProbeResult === true,
-    describe: "one-time macOS permission for Terminal to use your Documents folder — click Allow if a dialog appears",
-    install: async (progress) => {
-      progress("checking Terminal's access to Documents…");
-      tccProbeResult = await probeTerminalDocumentsAccess();
-      if (tccProbeResult === true) return { ok: true, detail: "already allowed" };
-      if (tccProbeResult === null) {
-        return { ok: false, detail: "could not verify folder access (no answer from the probe). Run setup again; if a macOS dialog appears, click Allow." };
-      }
-      // Previously denied. Forget the recorded "no" — this is the one thing a
-      // command CAN do; it cannot grant — so the genuine dialog can reappear.
-      // User-initiated (they asked for setup), once per run, and announced:
-      // that is the line between consent UX and nagware.
-      progress("macOS had this blocked — asking again; click Allow on the dialog…");
-      await run("/usr/bin/tccutil", ["reset", "SystemPolicyDocumentsFolder", "com.apple.Terminal"], 30 * 1000);
-      tccProbeResult = await probeTerminalDocumentsAccess();
-      if (tccProbeResult === true) return { ok: true, detail: "granted — thanks for the Allow" };
-      return {
-        ok: false,
-        detail:
-          "Documents access is still blocked for Terminal. Turn it on manually: " +
-          "System Settings → Privacy & Security → Files and Folders → Terminal → enable Documents Folder, " +
-          "then run setup again.",
-      };
-    },
-  },
   {
     key: "python",
     title: "Python (Miniconda)",
@@ -345,43 +248,41 @@ async function setupCall({ dryRun = false, progress = () => {} } = {}) {
     return { phase: "dryrun", plan };
   }
 
-  // Everything user-visible below is ALSO written to the progress window —
-  // announce, then act, in that order, by this code — so the user watches the
-  // install regardless of what the model says in the chat.
-  const p = (msg) => { logLine(`   ${msg}`); progress(msg); };
+  const p = (msg) => { progressState.message = msg; progress(msg); };
 
   if (!state.announced) {
     state.announced = true;
     const plan = await audit();
     if (plan.every((s) => s.satisfied)) {
       const v = await verify();
+      if (v.ok) { progressState.phase = "done"; progressState.version = v.version; }
       return v.ok
         ? { phase: "done", version: v.version, installed: [] }
         : { phase: "failed", step: "verify", detail: `everything is installed but \`vibefoundry --version\` did not answer (${v.evidence}) — run setup again; the first run of a fresh Python can be slow while macOS scans it` };
     }
-    ensureProgressWindow();
-    logLine("This is a " + plan.length + " step process:");
-    plan.forEach((s, i) => logLine(`  ${i + 1}. ${s.title}${s.satisfied ? "  ✓ already done" : ""}`));
-    logLine("");
+    progressState.phase = "announce";
+    progressState.plan = plan.map((x) => ({ title: x.title, satisfied: x.satisfied }));
+    progressState.current = null;
+    progressState.message = "";
     return { phase: "announce", plan };
   }
 
   const plan = await audit();
+  progressState.plan = plan.map((x) => ({ title: x.title, satisfied: x.satisfied }));
   const next = STEPS.find((s, i) => !plan[i].satisfied);
   if (next) {
-    ensureProgressWindow();
     const index = STEPS.indexOf(next) + 1;
-    logLine(`→ Step ${index}/${STEPS.length} — ${next.title}…`);
+    progressState.phase = "step";
+    progressState.current = { index, total: STEPS.length, title: next.title };
     const res = await next.install(p);
     if (!res.ok) {
-      logLine(`✗ ${next.title} failed: ${res.detail}`);
-      logLine("");
-      logLine("Fix the above, then say \"set me up to vibe code\" again — completed steps are skipped.");
+      progressState.phase = "failed";
+      progressState.error = `${next.title}: ${res.detail}`;
       return { phase: "failed", step: next.title, detail: res.detail };
     }
-    logLine(`✓ Step ${index}/${STEPS.length} — ${next.title} done${res.detail ? ` (${res.detail})` : ""}`);
-    logLine("");
     const after = await audit();
+    progressState.plan = after.map((x) => ({ title: x.title, satisfied: x.satisfied }));
+    progressState.message = "";
     return {
       phase: "step",
       index,
@@ -392,16 +293,18 @@ async function setupCall({ dryRun = false, progress = () => {} } = {}) {
     };
   }
 
-  logLine("→ Verifying…");
+  progressState.current = null;
+  progressState.message = "verifying…";
   const v = await verify();
   if (v.ok) {
-    logLine(`✓ All set — ${v.version} is ready.`);
-    logLine("");
-    logLine("You can close this window. Say \"open VibeFoundry\" in the chat to start.");
+    progressState.phase = "done";
+    progressState.version = v.version;
+    progressState.message = "";
     return { phase: "done", version: v.version };
   }
-  logLine(`✗ Verify failed: ${v.evidence}`);
+  progressState.phase = "failed";
+  progressState.error = `verify: ${v.evidence}`;
   return { phase: "failed", step: "verify", detail: `install finished but \`vibefoundry --version\` did not answer (${v.evidence}) — run setup again; the first run of a fresh Python can be slow while macOS scans it` };
 }
 
-module.exports = { setupCall };
+module.exports = { setupCall, getProgressState };
