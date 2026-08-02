@@ -27,6 +27,7 @@ console.log(`server under test: ${serverCmd.join(" ")}`);
 
 const child = spawn(serverCmd[0], serverCmd.slice(1), {
   stdio: ["pipe", "pipe", "inherit"],
+  env: { ...process.env, VF_SETUP_NO_WINDOW: "1" },
 });
 
 let buf = "";
@@ -259,7 +260,7 @@ function check(label, ok, detail) {
   // instructions mention preview_start, and — with a backend adoptable — the
   // open result carries a previewConfigName and a written launch.json.
   console.log("\nclaude host pass (fresh server, claude clientInfo)");
-  const c = spawn(serverCmd[0], serverCmd.slice(1), { stdio: ["pipe", "pipe", "inherit"] });
+  const c = spawn(serverCmd[0], serverCmd.slice(1), { stdio: ["pipe", "pipe", "inherit"], env: { ...process.env, VF_SETUP_NO_WINDOW: "1" } });
   let cbuf = "";
   const cwaiters = new Map();
   c.stdout.setEncoding("utf8");

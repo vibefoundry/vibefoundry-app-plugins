@@ -53,7 +53,40 @@ const PROJECTS_DIR = path.join(HOME, "Documents", "VibeFoundryProjects");
 // vibefoundry step "unsatisfied" exactly once per conversation, so every fresh
 // setup run delivers the latest release — re-running setup IS the update
 // channel — without looping forever.
-const state = { announced: false, vfUpgraded: false };
+const state = { announced: false, vfUpgraded: false, logFile: null, windowShown: false };
+
+// --- the deterministic progress display ----------------------------------------
+// The chat cannot be trusted with progress: only the model can put words there,
+// and models chain tool calls in silence (observed twice). So setup shows its
+// work on a surface OUR code owns — a real terminal window tailing a log this
+// process writes. Announce and act are adjacent lines of the same code path:
+// "Installing Miniconda…" appears BECAUSE the install is about to run, with no
+// model, host, or instruction in between. Chat narration remains a bonus.
+function logLine(text) {
+  if (!state.logFile) return;
+  try { fs.appendFileSync(state.logFile, text + "\n"); } catch { /* display only */ }
+}
+
+function ensureProgressWindow() {
+  if (state.windowShown || process.env.VF_SETUP_NO_WINDOW) return;
+  state.windowShown = true;
+  state.logFile = path.join(os.tmpdir(), `vibefoundry-setup-${Date.now()}.log`);
+  try {
+    fs.writeFileSync(
+      state.logFile,
+      "==============================\n" +
+        "  VibeFoundry Setup\n" +
+        "==============================\n\n"
+    );
+  } catch {
+    state.logFile = null;
+    return;
+  }
+  const cmd = WIN
+    ? `powershell -NoProfile -Command "Get-Content -Path '${state.logFile}' -Wait"`
+    : `clear; tail -n +1 -f "${state.logFile}"`;
+  openTerminal(HOME, cmd);
+}
 
 /** Run a command, capturing output; resolves {ok, out} rather than throwing. */
 function run(file, args, timeoutMs = 15 * 60 * 1000) {
@@ -312,6 +345,11 @@ async function setupCall({ dryRun = false, progress = () => {} } = {}) {
     return { phase: "dryrun", plan };
   }
 
+  // Everything user-visible below is ALSO written to the progress window —
+  // announce, then act, in that order, by this code — so the user watches the
+  // install regardless of what the model says in the chat.
+  const p = (msg) => { logLine(`   ${msg}`); progress(msg); };
+
   if (!state.announced) {
     state.announced = true;
     const plan = await audit();
@@ -321,15 +359,28 @@ async function setupCall({ dryRun = false, progress = () => {} } = {}) {
         ? { phase: "done", version: v.version, installed: [] }
         : { phase: "failed", step: "verify", detail: `everything is installed but \`vibefoundry --version\` did not answer (${v.evidence}) — run setup again; the first run of a fresh Python can be slow while macOS scans it` };
     }
+    ensureProgressWindow();
+    logLine("This is a " + plan.length + " step process:");
+    plan.forEach((s, i) => logLine(`  ${i + 1}. ${s.title}${s.satisfied ? "  ✓ already done" : ""}`));
+    logLine("");
     return { phase: "announce", plan };
   }
 
   const plan = await audit();
   const next = STEPS.find((s, i) => !plan[i].satisfied);
   if (next) {
+    ensureProgressWindow();
     const index = STEPS.indexOf(next) + 1;
-    const res = await next.install(progress);
-    if (!res.ok) return { phase: "failed", step: next.title, detail: res.detail };
+    logLine(`→ Step ${index}/${STEPS.length} — ${next.title}…`);
+    const res = await next.install(p);
+    if (!res.ok) {
+      logLine(`✗ ${next.title} failed: ${res.detail}`);
+      logLine("");
+      logLine("Fix the above, then say \"set me up to vibe code\" again — completed steps are skipped.");
+      return { phase: "failed", step: next.title, detail: res.detail };
+    }
+    logLine(`✓ Step ${index}/${STEPS.length} — ${next.title} done${res.detail ? ` (${res.detail})` : ""}`);
+    logLine("");
     const after = await audit();
     return {
       phase: "step",
@@ -341,10 +392,16 @@ async function setupCall({ dryRun = false, progress = () => {} } = {}) {
     };
   }
 
+  logLine("→ Verifying…");
   const v = await verify();
-  return v.ok
-    ? { phase: "done", version: v.version }
-    : { phase: "failed", step: "verify", detail: `install finished but \`vibefoundry --version\` did not answer (${v.evidence}) — run setup again; the first run of a fresh Python can be slow while macOS scans it` };
+  if (v.ok) {
+    logLine(`✓ All set — ${v.version} is ready.`);
+    logLine("");
+    logLine("You can close this window. Say \"open VibeFoundry\" in the chat to start.");
+    return { phase: "done", version: v.version };
+  }
+  logLine(`✗ Verify failed: ${v.evidence}`);
+  return { phase: "failed", step: "verify", detail: `install finished but \`vibefoundry --version\` did not answer (${v.evidence}) — run setup again; the first run of a fresh Python can be slow while macOS scans it` };
 }
 
 module.exports = { setupCall };
