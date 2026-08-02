@@ -20,17 +20,85 @@
  */
 
 const fs = require("fs");
+const http = require("http");
 const path = require("path");
 const { portOpen } = require("./instances");
+
+// --- the setup progress page ---------------------------------------------------
+// Claude has no widget system, but the plugin is a local process — so during
+// setup it serves one small page itself and registers it as a preview. The page
+// polls /state and renders the live step list; every word on it is written by
+// the code doing the installing. One preview_start opens it; after that, zero
+// model involvement. The server lives for the conversation and costs nothing.
+let progressServer = null;
+
+function progressHtml() {
+  return `<!doctype html><meta charset="utf-8"><title>VibeFoundry Setup</title>
+<body style="margin:0;font-family:ui-sans-serif,-apple-system,system-ui;background:#fff;color:#0d0d0d">
+<div style="max-width:520px;margin:8vh auto;padding:0 24px">
+<div style="font-size:44px;font-weight:800;color:#2070e8;letter-spacing:-2px">vf</div>
+<h2 style="margin:8px 0 4px;font-size:20px">Setting up your computer</h2>
+<div id="sub" style="color:#5d5d5d;font-size:13px;margin-bottom:20px">starting…</div>
+<div id="steps"></div>
+<div id="msg" style="color:#5d5d5d;font-size:13px;margin-top:14px;min-height:18px"></div>
+</div>
+<script>
+async function tick(){
+  try{
+    const s = await (await fetch('/state')).json();
+    const steps = document.getElementById('steps');
+    steps.innerHTML = (s.plan||[]).map(function(p,i){
+      const active = s.current && s.current.index === i+1;
+      const mark = p.satisfied ? '✓' : active ? '→' : '·';
+      const color = p.satisfied ? '#1a7f37' : active ? '#2070e8' : '#8f8f8f';
+      const weight = active ? 600 : 400;
+      return '<div style="padding:6px 0;font-size:15px;color:'+color+';font-weight:'+weight+'">'+mark+'  '+p.title+'</div>';
+    }).join('');
+    document.getElementById('msg').textContent = s.message || (s.error ? '✗ ' + s.error : '');
+    const sub = document.getElementById('sub');
+    if (s.phase === 'done') sub.textContent = '✓ All set — ' + (s.version||'') + '. Say "open VibeFoundry" in the chat.';
+    else if (s.phase === 'failed') sub.textContent = 'Setup stopped — the fix is below. Say "set me up" again to resume.';
+    else if (s.current) sub.textContent = 'Step ' + s.current.index + ' of ' + s.current.total;
+    else sub.textContent = 'preparing…';
+  }catch(e){/* server briefly busy between steps */}
+  setTimeout(tick, 700);
+}
+tick();
+</script></body>`;
+}
+
+/**
+ * Serve the progress page on an ephemeral port; idempotent per process.
+ * Resolves the port, or null if the OS refused a socket.
+ */
+function startProgressServer(getState) {
+  if (progressServer) return Promise.resolve(progressServer.address().port);
+  return new Promise((resolve) => {
+    const srv = http.createServer((req, res) => {
+      if (req.url === "/state") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(getState()));
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(progressHtml());
+    });
+    srv.on("error", () => resolve(null));
+    srv.listen(0, "127.0.0.1", () => {
+      progressServer = srv;
+      resolve(srv.address().port);
+    });
+  });
+}
 
 /**
  * Register `port` with the project's Preview pane. Returns the config name for
  * preview_start, or null if the file could not be written (the caller falls
  * back to telling the user the URL).
  */
-async function writeLaunchConfig(projectRoot, port) {
+async function writeLaunchConfig(projectRoot, port, nameOverride) {
   if (!projectRoot || !port) return null;
-  const name = `vibefoundry-${port}`;
+  const name = nameOverride || `vibefoundry-${port}`;
   const dir = path.join(projectRoot, ".claude");
   const file = path.join(dir, "launch.json");
 
@@ -49,7 +117,7 @@ async function writeLaunchConfig(projectRoot, port) {
   // offline.
   const kept = [];
   for (const c of doc.configurations) {
-    const isVf = c && typeof c.name === "string" && /^vibefoundry-\d+$/.test(c.name);
+    const isVf = c && typeof c.name === "string" && /^vibefoundry-(\d+|setup)$/.test(c.name);
     if (!isVf) {
       kept.push(c);
       continue;
@@ -77,4 +145,4 @@ async function writeLaunchConfig(projectRoot, port) {
   return name;
 }
 
-module.exports = { writeLaunchConfig };
+module.exports = { writeLaunchConfig, startProgressServer };
