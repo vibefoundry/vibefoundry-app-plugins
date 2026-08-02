@@ -573,7 +573,7 @@ function pluginDiagnostics() {
     // host turns out not to support roots — and there is no other way to see it.
     cwd: process.cwd(),
     env: Object.fromEntries(
-      Object.entries(process.env).filter(([k]) => /^(CODEX|MCP|WORKSPACE|PROJECT|PWD)/i.test(k))
+      Object.entries(process.env).filter(([k]) => /^(CODEX|MCP|WORKSPACE|PROJECT|PWD|PATH$|CLAUDE)/i.test(k))
     ),
     node: process.version,
     platform: process.platform,

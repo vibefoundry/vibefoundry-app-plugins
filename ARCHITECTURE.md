@@ -30,19 +30,17 @@ Three artifacts, three jobs, three repos:
 | **The IDE** | `vibefoundry-python-lib` → PyPI `vibefoundry` | Everything the user sees and does. Host-agnostic: works from a plain terminal, a browser, or any pane. |
 | **The website** | `vibefoundry-platform-real` | vibefoundry.ai. No install role — the hosted `/mcp` that used to hand out setup commands was deleted once this plugin could install things itself. |
 
-## Why the server is a compiled binary
+## Why the server is scripts, run by Node
 
-Hosts do not lend plugins a runtime: OpenAI's own local plugins ship compiled
-binaries for exactly this reason, and students' machines have no Node. So
-`bin/` carries the server with its JS engine baked in — nothing needs to exist
-on a machine before the plugin can run, which is what lets the plugin be the
-installer for everything else. `server/` remains the readable source;
-`./build.sh` cross-compiles every target from any machine.
-
-`bin/vf` is a three-line selector: macOS execs its architecture slice, Windows
-never runs it (the extensionless command makes CreateProcess resolve `vf.exe`
-beside it). There is no universal mac binary on purpose — fused, it crosses
-GitHub's 100MB file limit.
+The server is plain JavaScript. `bin/vf` bootstraps a runtime: any Node 18+
+already present (host-provided or the user's own), else a one-time download of
+the official pinned Node build into `~/.vibefoundry`. The only executable that
+ever runs is Node's signed binary; our code stays plaintext a security reviewer
+can read — the shape corporate application-control and AV policies are built
+to allow. Windows is the one exception: no per-OS manifest support and no
+shell entry means `bin/vf.exe` stays compiled there (`./build.sh`), with
+signing as the roadmap item for locked-down fleets. The binary-everywhere era
+is preserved at the `binary-era` tag.
 
 ## The rules the whole system obeys
 

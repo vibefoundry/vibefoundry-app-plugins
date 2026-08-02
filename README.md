@@ -81,18 +81,22 @@ Two consequences worth knowing:
   (`pip install -U vibefoundry`). 0.3.1 is the first version that ships the pane
   bundle and `--pane-path`.
 
-Nothing else. The server ships as compiled binaries in `bin/` with the JS
-runtime baked in — the same pattern OpenAI uses for its own local plugins,
-because Codex does not lend plugins a Node runtime and students' machines do
-not have one. `bin/vf` is a three-line selector: macOS picks its architecture
-slice; Windows never runs it, because the extensionless command makes
-CreateProcess resolve `vf.exe` beside it. There is deliberately no universal
-(lipo) mac binary — fused, it crosses GitHub's 100MB file limit.
+Nothing else. The server ships as plain, readable JavaScript, run by Node:
+`bin/vf` is a small bootstrap that uses any Node 18+ already on the machine
+(host-provided or the user's own) and otherwise downloads the official pinned
+Node build once into `~/.vibefoundry` — signed, reputed, and the only
+executable that ever runs. That shape is deliberate for corporate machines:
+application-control and AV policies gate unsigned executables, and plaintext
+scripts fed to signed Node are the one form that passes review. (An earlier
+era shipped compiled binaries — `git checkout binary-era` to see it — which
+worked flawlessly but wore exactly the unsigned-exe profile those policies
+block.)
 
-To rebuild after changing the server: `./build.sh` (needs [bun](https://bun.sh);
-cross-compiles all targets from any machine and runs the selftest against the
-selector). The source in `server/` stays the readable truth of what the
-binaries do.
+The one exception is Windows: neither host's manifest can name a per-OS
+command, and Windows cannot execute the shell entry — so `bin/vf.exe` (built
+by `./build.sh` with [bun](https://bun.sh)) remains a compiled artifact there,
+resolved automatically because the extensionless command makes CreateProcess
+append `.exe`. Signing it is the standing roadmap item for locked-down fleets.
 
 ## Install
 
