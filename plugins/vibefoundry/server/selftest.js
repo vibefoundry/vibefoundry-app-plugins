@@ -142,6 +142,13 @@ function check(label, ok, detail) {
     check("first call reports already set up", asc.phase === "done", `phase=${asc.phase}`);
   }
 
+  console.log("\nresources/read (the setup widget — must need nothing installed)");
+  const sw = await call("resources/read", { uri: "ui://widget/vibefoundry-setup.html" });
+  const swHtml = sw.result?.contents?.[0]?.text || "";
+  check("setup widget serves from the plugin itself", swHtml.includes("Setting up your computer"), `${(swHtml.length/1024).toFixed(1)} KB`);
+  const setupTool = (tools.result?.tools || []).find((t) => t.name === "setup_vibefoundry");
+  check("setup tool is linked to its own widget", setupTool?._meta?.["openai/outputTemplate"] === "ui://widget/vibefoundry-setup.html");
+
   console.log("\nresources/read (the pane bundle)");
   const res = await call("resources/read", { uri: "ui://widget/vibefoundry.html" });
   const html = res.result?.contents?.[0]?.text;

@@ -44,6 +44,52 @@ const TOOL_META = {
   ui: { resourceUri: WIDGET_URI },
 };
 
+// The setup card gets its OWN widget, embedded right here — it must render on
+// machines where nothing is installed yet, so it cannot come from the python
+// package the way the IDE pane does. Vanilla JS, self-contained, polls the
+// live install state through the vf_request bridge.
+const SETUP_WIDGET_URI = "ui://widget/vibefoundry-setup.html";
+const SETUP_TOOL_META = {
+  "openai/outputTemplate": SETUP_WIDGET_URI,
+  ui: { resourceUri: SETUP_WIDGET_URI },
+};
+const SETUP_WIDGET_HTML = `<!doctype html><meta charset="utf-8"><title>VibeFoundry Setup</title>
+<body style="margin:0;font-family:ui-sans-serif,-apple-system,system-ui;background:#fff;color:#0d0d0d">
+<div style="padding:18px 22px">
+<div style="font-size:30px;font-weight:800;color:#2070e8;letter-spacing:-1.5px">vf</div>
+<div style="font-size:15px;font-weight:600;margin:4px 0 2px">Setting up your computer</div>
+<div id="sub" style="font-size:12px;color:#5d5d5d;margin-bottom:10px">preparing…</div>
+<div id="steps"></div>
+<div id="msg" style="font-size:12px;color:#5d5d5d;margin-top:8px;min-height:16px"></div>
+</div>
+<script>
+async function state(){
+  try{
+    const r = await window.openai.callTool('vf_request',{path:'/__plugin/setup-state'});
+    const sc = (r && (r.structuredContent || (r.result && r.result.structuredContent))) || {};
+    return sc.json || null;
+  }catch(e){ return null; }
+}
+async function tick(){
+  const s = await state();
+  if (s && s.phase && s.phase !== 'idle') {
+    document.getElementById('steps').innerHTML = (s.plan||[]).map(function(p,i){
+      const active = s.current && s.current.index === i+1;
+      const mark = p.satisfied ? '✓' : active ? '→' : '·';
+      const color = p.satisfied ? '#1a7f37' : active ? '#2070e8' : '#8f8f8f';
+      return '<div style="padding:3px 0;font-size:13px;color:'+color+';font-weight:'+(active?600:400)+'">'+mark+'  '+p.title+'</div>';
+    }).join('');
+    document.getElementById('msg').textContent = s.message || (s.error ? '✗ ' + s.error : '');
+    const sub = document.getElementById('sub');
+    if (s.phase==='done') sub.textContent = '✓ All set — ' + (s.version||'') + '. Say "open VibeFoundry" to start.';
+    else if (s.phase==='failed') sub.textContent = 'Setup stopped — say "set me up" again to resume.';
+    else if (s.current) sub.textContent = 'Step ' + s.current.index + ' of ' + s.current.total;
+  }
+  setTimeout(tick, 700);
+}
+if (window.openai && window.openai.callTool) tick(); else document.getElementById('sub').textContent='waiting for host…';
+</script></body>`;
+
 const SERVER_INFO = { name: "vibefoundry", version: "0.1.0" };
 
 const INSTRUCTIONS =
@@ -314,9 +360,9 @@ const SETUP_TOOL = {
     },
   },
   annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: true, readOnlyHint: false },
-  // The widget doubles as the setup progress card on Codex: the host renders
-  // it automatically off every staged result — deterministic, in-app, no model.
-  _meta: TOOL_META,
+  // Its own embedded widget: the progress card renders on machines where the
+  // python package does not exist yet — the IDE pane widget cannot.
+  _meta: SETUP_TOOL_META,
 };
 
 const PROXY_TOOL = {
@@ -874,6 +920,7 @@ async function handle(msg) {
       return result(id, {
         resources: [
           { uri: WIDGET_URI, name: "VibeFoundry Pane", description: "The VibeFoundry IDE.", mimeType: WIDGET_MIME },
+          { uri: SETUP_WIDGET_URI, name: "VibeFoundry Setup", description: "Live install progress.", mimeType: WIDGET_MIME },
         ],
       });
 
@@ -881,6 +928,12 @@ async function handle(msg) {
       return result(id, { resourceTemplates: [] });
 
     case "resources/read": {
+      if (params.uri === SETUP_WIDGET_URI) {
+        // Embedded, dependency-free: must work before anything is installed.
+        return result(id, {
+          contents: [{ uri: SETUP_WIDGET_URI, mimeType: WIDGET_MIME, text: SETUP_WIDGET_HTML, _meta: { "openai/widgetPrefersBorder": false } }],
+        });
+      }
       if (params.uri !== WIDGET_URI) return rpcError(id, -32602, "Unknown resource: " + params.uri);
       // The CSP below has to name a real backend, and this can be read before
       // any launch happened in this process.
