@@ -68,9 +68,9 @@ const INSTRUCTIONS =
 // name rather than a widget.
 const CLAUDE_INSTRUCTIONS =
   " After open_vibefoundry succeeds it returns previewConfigName — immediately " +
-  "call preview_start with that configName to put the IDE pane on screen; the " +
-  "user works in the pane, so do not read or edit the project's files yourself " +
-  "unless they ask you to.";
+  "call preview_start with that configName to put the IDE pane on screen; that " +
+  "is the only step after the tool call. The user works in the pane, so do not " +
+  "read or edit the project's files yourself unless they ask you to.";
 
 // The backend the pane is currently pointed at, and the folder last asked for.
 // Both are per-process, and a process is per-conversation — so a second
@@ -466,6 +466,19 @@ async function openVibeFoundry(args) {
 async function paneHandoff(projectRoot, port) {
   if (!isClaude()) return { text: "", fields: {} };
   const name = await writeLaunchConfig(projectRoot, port);
+  // Tell the BACKEND it is pane-hosted, in code, right now — before the pane
+  // can possibly load. The IDE reads this off /api/health at boot and trims
+  // its chrome. Deterministic by construction: no URL marker (Claude forbids
+  // query strings in config URLs), no navigation instruction for a model to
+  // skip, no webview storage. Best-effort on old backends that lack the
+  // endpoint — everything still works, the chrome is just untrimmed.
+  try {
+    await fetch(`http://127.0.0.1:${port}/api/ui/pane`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: true }),
+    });
+  } catch { /* backend may predate the endpoint */ }
   note("claude_pane", { config: name, port });
   if (name) {
     return {

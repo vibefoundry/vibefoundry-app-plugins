@@ -305,12 +305,15 @@ function check(label, ok, detail) {
     const copen = await ccall("tools/call", { name: "open_vibefoundry", arguments: {} });
     const csc = copen.result?.structuredContent || {};
     check("claude open returns a previewConfigName", csc.previewConfigName === `vibefoundry-${adoptable.port}`, String(csc.previewConfigName));
+    // The deterministic pane signal: the plugin must have told the backend.
+    const ph = await (await fetch(`http://127.0.0.1:${adoptable.port}/api/health`)).json();
+    check("backend was marked pane-hosted, in code", ph.pane_mode === true, JSON.stringify({ pane_mode: ph.pane_mode }));
     const lc = path.join(folder, ".claude", "launch.json");
     let entry = null;
     try { entry = JSON.parse(require("fs").readFileSync(lc, "utf8")).configurations.find((x) => x.name === csc.previewConfigName); } catch { /* read below */ }
     check(
-      "launch.json has the attach-only config with the pane marker",
-      !!entry && entry.url === `http://localhost:${adoptable.port}/?pane=1` && !entry.command && !entry.runtimeExecutable,
+      "launch.json config is a bare origin (Claude forbids query strings)",
+      !!entry && entry.url === `http://localhost:${adoptable.port}` && !entry.command && !entry.runtimeExecutable,
       JSON.stringify(entry)
     );
   } else {
