@@ -58,11 +58,14 @@ async function writeLaunchConfig(projectRoot, port) {
     if (await portOpen(c.port)) kept.push(c);
   }
 
-  // ?pane=1 is the IDE's explicit "you're embedded" signal. Claude's preview
-  // is a native webview, not an iframe — the app's self!==top detection sees
-  // nothing — so without the marker the pane renders the full browser chrome,
-  // native-terminal buttons and all.
-  kept.push({ name, url: `http://localhost:${port}/?pane=1`, port });
+  // Bare origin ONLY: Claude rejects localhost preview URLs carrying a path or
+  // query ("a localhost url must be just the server's origin"), which killed
+  // the ?pane=1 marker riding in this url. The sanctioned pattern is the one
+  // its own error message names: open the bare origin, then NAVIGATE the
+  // preview to the page — so the ?pane=1 hop happens as a model instruction
+  // after preview_start, and the app persists the marker in the webview's own
+  // storage so every later bare-origin load stays in pane mode.
+  kept.push({ name, url: `http://localhost:${port}`, port });
   doc.configurations = kept;
 
   try {
