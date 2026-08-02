@@ -275,13 +275,28 @@ async function audit() {
 /**
  * Everything installed — prove it with the same probes the launcher uses, so
  * setup finishing means launch will work.
+ *
+ * Patient by design: the FIRST execution of a freshly installed Python on
+ * macOS can take tens of seconds while Gatekeeper/XProtect scan it — which
+ * once made this declare a perfectly good install "not runnable" at a 30s
+ * timeout, self-healing on the warm re-run. So: generous timeouts, one retry,
+ * and when it still fails, the actual error comes back with it — a diagnostic
+ * that hides its evidence turns every failure into telepathy.
  */
 async function verify() {
   wireShell();
-  const direct = fs.existsSync(VF) ? await run(VF, ["--version"], 30 * 1000) : { ok: false, out: "" };
-  const viaShell = await shell("vibefoundry --version");
-  const version = (direct.ok && direct.out) || (viaShell.ok && viaShell.out) || null;
-  return version ? { ok: true, version: version.split("\n").pop() } : { ok: false };
+  const attempt = async (timeoutMs) => {
+    const direct = fs.existsSync(VF) ? await run(VF, ["--version"], timeoutMs) : { ok: false, out: "no file at " + VF };
+    if (direct.ok && direct.out) return { ok: true, version: direct.out.split("\n").pop() };
+    const viaShell = await shell("vibefoundry --version", timeoutMs);
+    if (viaShell.ok && viaShell.out) return { ok: true, version: viaShell.out.split("\n").pop() };
+    return { ok: false, evidence: (direct.out || viaShell.out || "no output").slice(-300) };
+  };
+  const first = await attempt(90 * 1000);
+  if (first.ok) return first;
+  // Cold start may have eaten the whole first window; one warm retry.
+  const second = await attempt(90 * 1000);
+  return second.ok ? second : { ok: false, evidence: second.evidence };
 }
 
 /**
@@ -304,7 +319,7 @@ async function setupCall({ dryRun = false, progress = () => {} } = {}) {
       const v = await verify();
       return v.ok
         ? { phase: "done", version: v.version, installed: [] }
-        : { phase: "failed", step: "verify", detail: "everything is installed but `vibefoundry --version` does not run — run setup again, and if it persists open a new terminal and try the command there" };
+        : { phase: "failed", step: "verify", detail: `everything is installed but \`vibefoundry --version\` did not answer (${v.evidence}) — run setup again; the first run of a fresh Python can be slow while macOS scans it` };
     }
     return { phase: "announce", plan };
   }
@@ -329,7 +344,7 @@ async function setupCall({ dryRun = false, progress = () => {} } = {}) {
   const v = await verify();
   return v.ok
     ? { phase: "done", version: v.version }
-    : { phase: "failed", step: "verify", detail: "install finished but `vibefoundry --version` does not run — run setup again, and if it persists open a new terminal and try the command there" };
+    : { phase: "failed", step: "verify", detail: `install finished but \`vibefoundry --version\` did not answer (${v.evidence}) — run setup again; the first run of a fresh Python can be slow while macOS scans it` };
 }
 
 module.exports = { setupCall };
