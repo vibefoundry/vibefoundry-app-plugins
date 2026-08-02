@@ -335,6 +335,21 @@ function check(label, ok, detail) {
   c.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} }) + "\n");
   await new Promise((r) => setTimeout(r, 400));
 
+  // Setup's progress pane must register even when the host answers NO roots —
+  // real Claude doesn't — using the model-passed projectRoot as the fallback.
+  currentRoots = [];
+  const csetup1 = await ccall("tools/call", { name: "setup_vibefoundry", arguments: { projectRoot: folder } });
+  const cs1 = csetup1.result?.structuredContent || {};
+  if (cs1.phase === "announce") {
+    check("claude setup registers the progress pane without roots", cs1.setupPreviewConfigName === "vibefoundry-setup", String(cs1.setupPreviewConfigName));
+    let sEntry = null;
+    try { sEntry = JSON.parse(require("fs").readFileSync(path.join(folder, ".claude", "launch.json"), "utf8")).configurations.find((x) => x.name === "vibefoundry-setup"); } catch { /* checked below */ }
+    check("launch.json holds the setup pane, attach-only bare origin", !!sEntry && /^http:\/\/localhost:\d+$/.test(sEntry.url) && !sEntry.command, JSON.stringify(sEntry));
+  } else {
+    check("setup announce still reachable in claude pass", cs1.phase === "done", `phase=${cs1.phase}`);
+  }
+  currentRoots = [folder];
+
   const { discover: cdiscover } = require("./instances");
   const adoptable = (await cdiscover()).find((i) => i.folder && i.folder.replace(/^\/private/, "") === folder.replace(/^\/private/, ""));
   if (adoptable) {

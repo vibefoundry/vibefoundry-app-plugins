@@ -123,8 +123,11 @@ const INSTRUCTIONS =
 const CLAUDE_INSTRUCTIONS =
   " After open_vibefoundry succeeds it returns previewConfigName — immediately " +
   "call preview_start with that configName to put the IDE pane on screen; that " +
-  "is the only step after the tool call. The user works in the pane, so do not " +
-  "read or edit the project's files yourself unless they ask you to.";
+  "is the only step after the tool call. When calling setup_vibefoundry, ALWAYS " +
+  "pass the absolute workspace path as projectRoot; if its result includes " +
+  "setupPreviewConfigName, immediately call preview_start with it so the user " +
+  "watches the install live. The user works in the pane, so do not read or edit " +
+  "the project's files yourself unless they ask you to.";
 
 // The backend the pane is currently pointed at, and the folder last asked for.
 // Both are per-process, and a process is per-conversation — so a second
@@ -359,6 +362,13 @@ const SETUP_TOOL = {
   inputSchema: {
     type: "object",
     properties: {
+      projectRoot: {
+        type: "string",
+        description:
+          "Absolute path of the current workspace. Used only to register the " +
+          "live setup-progress pane; installs are machine-wide regardless. " +
+          "Always pass it.",
+      },
       dryRun: {
         type: "boolean",
         description:
@@ -851,11 +861,21 @@ async function handle(msg) {
           let setupPane = null;
           if (isClaude() && r.phase === "announce") {
             const pport = await startProgressServer(getProgressState);
+            // Where to register the preview: the host's root when it gives one,
+            // else the workspace the model named, else the last folder opened.
+            // Real Claude turned out not to answer roots/list, and requiring it
+            // made the card silently not exist — a display should degrade to
+            // absent only when NOBODY knows the workspace.
             const roots = await workspaceRoots();
-            if (pport && roots.length) {
-              setupPane = await writeLaunchConfig(roots[0], pport, "vibefoundry-setup");
+            const projDir =
+              (roots.length && roots[0]) ||
+              String((args && args.projectRoot) || "").trim() ||
+              LAST_PROJECT_ROOT;
+            if (pport && projDir) {
+              setupPane = await writeLaunchConfig(projDir, pport, "vibefoundry-setup");
             }
-            note("claude_setup_pane", { port: pport, config: setupPane });
+            note("claude_setup_pane", { port: pport, dir: projDir || null, config: setupPane });
+            if (setupPane) r.setupPreviewConfigName = setupPane;
           }
 
           // The user-facing text is fenced between ⟦ ⟧ and the contract framed
