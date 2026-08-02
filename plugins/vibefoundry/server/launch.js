@@ -167,7 +167,7 @@ async function launch(folder, timeoutMs = 45000) {
       `echo DENIED > "${accessMarker}"; ` +
       `echo ""; echo "macOS is blocking Terminal from this folder."; ` +
       `echo "Fix: System Settings > Privacy & Security > Files and Folders > Terminal > enable Documents Folder"; ` +
-      `echo "(or say \\"set me up to vibe code\\" and setup will re-ask for permission)"; echo ""; ` +
+      `echo "(then say \\"open VibeFoundry\\" again — or click Allow if a dialog appears)"; echo ""; ` +
       `fi; ` +
       launchCmd;
   }
@@ -192,8 +192,9 @@ async function launch(folder, timeoutMs = 45000) {
       ok: false,
       error:
         "macOS is blocking Terminal from that folder, so the backend cannot start there. " +
-        "Either enable it (System Settings → Privacy & Security → Files and Folders → Terminal → " +
-        "Documents Folder) or run setup_vibefoundry, which will ask for the permission again.",
+        "Enable it in System Settings → Privacy & Security → Files and Folders → Terminal → " +
+        "Documents Folder, then say \"open VibeFoundry\" again. (If macOS shows a permission " +
+        "dialog instead, just click Allow.)",
     };
   }
   const now = await discover();
