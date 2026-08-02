@@ -145,7 +145,7 @@ function check(label, ok, detail) {
   console.log("\nresources/read (the setup widget — must need nothing installed)");
   const sw = await call("resources/read", { uri: "ui://widget/vibefoundry-setup.html" });
   const swHtml = sw.result?.contents?.[0]?.text || "";
-  check("setup widget serves from the plugin itself", swHtml.includes("Setting up your computer"), `${(swHtml.length/1024).toFixed(1)} KB`);
+  check("setup widget serves from the plugin itself", swHtml.includes("Setting Up Your Computer"), `${(swHtml.length/1024).toFixed(1)} KB`);
   const setupTool = (tools.result?.tools || []).find((t) => t.name === "setup_vibefoundry");
   check("setup tool is linked to its own widget", setupTool?._meta?.["openai/outputTemplate"] === "ui://widget/vibefoundry-setup.html");
 

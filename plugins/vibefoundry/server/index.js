@@ -55,10 +55,16 @@ const SETUP_TOOL_META = {
 };
 function embeddedCard(initialSub) {
   return `<!doctype html><meta charset="utf-8"><title>VibeFoundry Setup</title>
-<body style="margin:0;font-family:ui-sans-serif,-apple-system,system-ui;background:#fff;color:#0d0d0d">
+<style>
+.vfdots span{opacity:.15;animation:vfb 1.2s infinite}
+.vfdots span:nth-child(2){animation-delay:.2s}
+.vfdots span:nth-child(3){animation-delay:.4s}
+@keyframes vfb{0%,80%,100%{opacity:.15}30%{opacity:1}}
+</style><body style="margin:0;font-family:ui-sans-serif,-apple-system,system-ui;background:#fff;color:#0d0d0d">
 <div style="padding:18px 22px">
 <div style="font-size:30px;font-weight:800;color:#2070e8;letter-spacing:-1.5px">vf</div>
-<div style="font-size:15px;font-weight:600;margin:4px 0 2px">Setting up your computer</div>
+<div style="font-size:15px;font-weight:600;margin:4px 0 2px">Setting Up Your Computer</div>
+<div style="font-size:12px;color:#5d5d5d;margin-bottom:4px">This can take 5 to 10 minutes — I'll update you when we're done!</div>
 <div id="sub" style="font-size:12px;color:#5d5d5d;margin-bottom:10px">${initialSub}</div>
 <div id="steps"></div>
 <div id="msg" style="font-size:12px;color:#5d5d5d;margin-top:8px;min-height:16px"></div>
@@ -78,7 +84,7 @@ async function tick(){
       const active = s.current && s.current.index === i+1;
       const mark = p.satisfied ? '✓' : active ? '→' : '·';
       const color = p.satisfied ? '#1a7f37' : active ? '#2070e8' : '#8f8f8f';
-      return '<div style="padding:3px 0;font-size:13px;color:'+color+';font-weight:'+(active?600:400)+'">'+mark+'  '+p.title+'</div>';
+      return '<div style="padding:3px 0;font-size:13px;color:'+color+';font-weight:'+(active?600:400)+'">'+mark+'  '+p.title+(active?'<span class=\"vfdots\"><span>.</span><span>.</span><span>.</span></span>':'')+'</div>';
     }).join('');
     document.getElementById('msg').textContent = s.message || (s.error ? '✗ ' + s.error : '');
     const sub = document.getElementById('sub');
