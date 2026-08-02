@@ -1,0 +1,45 @@
+#!/bin/sh
+# Entry point on macOS/Linux. Windows never runs this file — the extensionless
+# command makes CreateProcess resolve vf.exe beside it.
+#
+# The server is plain JavaScript (../server/index.js); this only finds it a
+# runtime. Order: a Node already on this machine (host-provided or user's own,
+# v18+ for fetch), then the private copy from a previous bootstrap, then a
+# one-time download of the official pinned build into ~/.vibefoundry. When a
+# runtime already exists this whole file is a no-op passthrough.
+set -e
+dir="$(cd "$(dirname "$0")" && pwd)"
+server="$dir/../server/index.js"
+private_root="$HOME/.vibefoundry"
+
+# accept a node only if it is new enough for the server (fetch needs >=18)
+usable() {
+  v="$("$1" --version 2>/dev/null | sed 's/^v//' | cut -d. -f1)" || return 1
+  [ -n "$v" ] && [ "$v" -ge 18 ]
+}
+
+if command -v node >/dev/null 2>&1 && usable "$(command -v node)"; then
+  exec node "$server"
+fi
+
+NODE_V="22.14.0"
+case "$(uname -sm)" in
+  "Darwin arm64")  plat="darwin-arm64" ;;
+  "Darwin x86_64") plat="darwin-x64" ;;
+  "Linux x86_64")  plat="linux-x64" ;;
+  "Linux aarch64") plat="linux-arm64" ;;
+  *) echo "vibefoundry: unsupported platform: $(uname -sm)" >&2; exit 1 ;;
+esac
+private="$private_root/node-v$NODE_V-$plat/bin/node"
+
+if [ ! -x "$private" ]; then
+  echo "vibefoundry: fetching its runtime (one time, ~30MB)…" >&2
+  mkdir -p "$private_root"
+  url="https://nodejs.org/dist/v$NODE_V/node-v$NODE_V-$plat.tar.gz"
+  if ! curl -fsSL "$url" | tar -xz -C "$private_root"; then
+    echo "vibefoundry: could not download Node from nodejs.org." >&2
+    echo "If this network blocks it, install Node 18+ yourself and restart the app." >&2
+    exit 1
+  fi
+fi
+exec "$private" "$server"
