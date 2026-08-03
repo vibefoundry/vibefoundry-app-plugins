@@ -6,8 +6,8 @@
     "url": "https://vibefoundry.ai"
   },
   "metadata": {
-    "description": "VibeFoundry — the data-science IDE, set up and launched as an in-app pane.",
-    "version": "0.5.0"
+    "description": "VibeFoundry \u2014 the data-science IDE, set up and launched as an in-app pane.",
+    "version": "0.9.0"
   },
   "plugins": [
     {
