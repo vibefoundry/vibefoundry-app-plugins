@@ -78,4 +78,4 @@ fix so there is nothing for a model to improvise.
 
 ## Contact
 
-security@vibefoundry.ai · https://vibefoundry.ai
+angelo@vibefoundry.ai · https://vibefoundry.ai
