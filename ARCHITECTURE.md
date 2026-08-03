@@ -37,10 +37,10 @@ already present (host-provided or the user's own), else a one-time download of
 the official pinned Node build into `~/.vibefoundry`. The only executable that
 ever runs is Node's signed binary; our code stays plaintext a security reviewer
 can read — the shape corporate application-control and AV policies are built
-to allow. Windows is the one exception: no per-OS manifest support and no
-shell entry means `bin/vf.exe` stays compiled there (`./build.sh`), with
-signing as the roadmap item for locked-down fleets. The binary-everywhere era
-is preserved at the `binary-era` tag.
+to allow. Windows runs the same scripts: `bin/vf.exe` is the official
+`node.exe` renamed (signature and hash intact — verify against nodejs.org),
+pointed at `server/index.js` by the manifest args. Nothing is compiled by us
+on any platform. The compiled era is preserved at the `binary-era` tag.
 
 ## The rules the whole system obeys
 

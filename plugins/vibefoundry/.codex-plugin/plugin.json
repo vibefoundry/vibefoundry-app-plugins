@@ -1,7 +1,7 @@
 {
   "name": "vibefoundry",
-  "version": "0.8.8",
-  "description": "Sets up and opens the VibeFoundry data-science IDE as a pane — installs everything it needs itself, then launches it in a terminal exactly as you would yourself.",
+  "version": "0.9.0",
+  "description": "Sets up and opens the VibeFoundry data-science IDE as a pane \u2014 installs everything it needs itself, then launches it in a terminal exactly as you would yourself.",
   "author": {
     "name": "VibeFoundry",
     "url": "https://vibefoundry.ai"
@@ -9,15 +9,23 @@
   "homepage": "https://vibefoundry.ai",
   "repository": "https://github.com/vibefoundry/vibefoundry-app-plugins",
   "license": "MIT",
-  "keywords": ["data science", "IDE", "analytics"],
+  "keywords": [
+    "data science",
+    "IDE",
+    "analytics"
+  ],
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "VibeFoundry",
     "shortDescription": "Set up and open the VibeFoundry IDE as a pane",
-    "longDescription": "Say \"set me up to vibe code\" and the plugin installs everything itself — Python, git, the data libraries, and the VibeFoundry IDE (the `vibefoundry` python package). Then \"open VibeFoundry\" launches it in a terminal on your current project and renders the IDE as a pane.",
+    "longDescription": "Say \"set me up to vibe code\" and the plugin installs everything itself \u2014 Python, git, the data libraries, and the VibeFoundry IDE (the `vibefoundry` python package). Then \"open VibeFoundry\" launches it in a terminal on your current project and renders the IDE as a pane.",
     "developerName": "VibeFoundry",
     "category": "Productivity",
-    "capabilities": ["Interactive", "Read", "Write"],
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
     "websiteURL": "https://vibefoundry.ai",
     "defaultPrompt": [
       "Set me up to vibe code.",

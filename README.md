@@ -92,11 +92,14 @@ era shipped compiled binaries — `git checkout binary-era` to see it — which
 worked flawlessly but wore exactly the unsigned-exe profile those policies
 block.)
 
-The one exception is Windows: neither host's manifest can name a per-OS
-command, and Windows cannot execute the shell entry — so `bin/vf.exe` (built
-by `./build.sh` with [bun](https://bun.sh)) remains a compiled artifact there,
-resolved automatically because the extensionless command makes CreateProcess
-append `.exe`. Signing it is the standing roadmap item for locked-down fleets.
+Windows runs the same scripts: `bin/vf.exe` is the OFFICIAL `node.exe`,
+renamed — Windows resolves the extensionless command to it, and the manifest's
+args point it at `server/index.js`. Renaming changes neither content nor
+Authenticode signature, so the one executable in this repo is signed by the
+OpenJS Foundation and byte-identical to the nodejs.org release — verify with
+`shasum -a 256 plugins/vibefoundry/bin/vf.exe` against nodejs.org's
+SHASUMS256.txt for the pinned version in `build.sh`. Nothing here is compiled
+by us, on any platform; there is nothing left to sign.
 
 ## Install
 

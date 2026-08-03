@@ -9,7 +9,10 @@
 # runtime already exists this whole file is a no-op passthrough.
 set -e
 dir="$(cd "$(dirname "$0")" && pwd)"
-server="$dir/../server/index.js"
+# The manifests pass the server path as $1 (Windows needs it: bin/vf.exe is
+# the OFFICIAL node.exe, renamed — it can't default a script). Fall back to
+# the known location when launched bare.
+server="${1:-$dir/../server/index.js}"
 private_root="$HOME/.vibefoundry"
 
 # accept a node only if it is new enough for the server (fetch needs >=18)
