@@ -40,7 +40,7 @@ function progressHtml() {
 .vfdots span:nth-child(3){animation-delay:.4s}
 @keyframes vfb{0%,80%,100%{opacity:.15}30%{opacity:1}}
 </style><body style="margin:0;font-family:ui-sans-serif,-apple-system,system-ui;background:#fff;color:#0d0d0d">
-<div style="max-width:520px;margin:8vh auto;padding:0 24px">
+<div style="max-width:520px;margin:0;padding:24px">
 <div style="font-size:44px;font-weight:800;color:#2070e8;letter-spacing:-2px">vf</div>
 <h2 style="margin:8px 0 4px;font-size:20px">Setting Up Your Computer</h2>
 <div style="font-size:12px;color:#5d5d5d;margin-bottom:4px">This can take 5 to 10 minutes — I'll update you when we're done!</div>
