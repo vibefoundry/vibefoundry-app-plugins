@@ -111,10 +111,15 @@ function openTerminal(cwd, cmd) {
     // sidesteps nesting quotes inside quotes — same trick the library's own
     // /api/terminal/launch uses. The `""` is start's window title slot; without
     // it, start would eat the quoted path as the title.
+    // windowsVerbatimArguments is load-bearing: without it Node re-escapes the
+    // embedded quotes per CommandLineToArgvW rules, start receives mangled
+    // backslash-quote soup, and Windows pops "cannot find '\\'" instead of a
+    // terminal. Our string is already exactly the line cmd should see.
     spawn(process.env.ComSpec || "cmd.exe", ["/c", `start "" /d "${cwd}" cmd /k ${cmd}`], {
       stdio: "ignore",
       detached: true,
       windowsHide: false,
+      windowsVerbatimArguments: true,
     }).unref();
     return true;
   }
