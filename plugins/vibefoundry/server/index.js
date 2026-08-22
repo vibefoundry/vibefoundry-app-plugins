@@ -132,12 +132,16 @@ const INSTRUCTIONS =
   "commands: re-running setup_vibefoundry is the only remedy you may offer. " +
   "Never call vf_request yourself: it exists only for the pane UI. " +
   "When the user asks a QUESTION about their own data — what is in it, how much, " +
-  "which, when, a total, a comparison, a ranking — answer it with the data tools " +
-  "rather than from memory and rather than by writing a script: data_catalog to " +
-  "find the table, data_schema to read its real columns, then data_query to run " +
-  "one narrow SQL SELECT and report the answer in the chat. Reach for data_pull " +
-  "only when the user is BUILDING something that needs the rows on disk. If any " +
-  "of them reports that no organization is connected, call connect_organization. " +
+  "which, when, a total, a comparison, a ranking — never answer it from memory, " +
+  "and never answer it in chat alone: VibeFoundry answers a question by building " +
+  "a small script. data_catalog to find the table, data_schema to read its real " +
+  "columns, data_pull to land exactly the rows the question needs in " +
+  "app_folder/scripts/<name>/raw_pulls/, numbered steps in steps/, and the answer " +
+  "written into final_output/ — you then read final_output/ and report what is " +
+  "there. The full folder rules arrive with your first VibeFoundry tool result; " +
+  "vibefoundry_rules re-reads them if the conversation runs long. A follow-up on " +
+  "the same subject modifies that same script instead of starting a new one. If " +
+  "any tool reports that no organization is connected, call connect_organization. " +
   "Never ask the user for an API key, an app id, a secret or a .env file: the " +
   "plugin holds no credentials and never needs one from the chat.";
 
@@ -592,11 +596,43 @@ function textResult(text, structured) {
 }
 
 // --- the data tools -----------------------------------------------------------
-// Same preamble for all five: resolve the folder the way open_vibefoundry does,
+// Same preamble for all six: resolve the folder the way open_vibefoundry does,
 // make sure a backend is serving THAT folder, and refuse a backend too old to
 // have /api/org/*. Only then does anything get relayed.
 
 const DATA_TOOLS = data.dataTools(TOOL_META);
+
+// The rules ride along on the first tool result that has a backend behind it,
+// and this process is one conversation — the same trick as setup.js's
+// state.vfUpgraded, for the same reason. A model that has not read them puts
+// scripts and outputs in the wrong folders, and repeating them on every result
+// would cost more context than the answers do.
+let RULES_ATTACHED = false;
+
+/**
+ * Prepend the project's rules to a result, once per conversation.
+ *
+ * Never allowed to fail the tool it rides on: /api/rules is best-effort and a
+ * missing rulebook must cost the user nothing. The flag is set only when the
+ * rules actually attached, so a backend that was still starting up gets another
+ * chance on the next call rather than losing them for the whole conversation.
+ */
+async function attachRules(port, res) {
+  if (RULES_ATTACHED || !port || !res || !Array.isArray(res.content)) return res;
+  let md = "";
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/api/rules`);
+    if (r.ok) md = String(((await r.json()) || {}).markdown || "").trim();
+  } catch {
+    /* best effort — the real work already succeeded */
+  }
+  if (!md) return res;
+  RULES_ATTACHED = true;
+  const first = res.content[0];
+  if (first && first.type === "text") first.text = `${md}\n\n---\n\n${first.text}`;
+  else res.content.unshift({ type: "text", text: md });
+  return res;
+}
 
 /**
  * A backend on the requested folder, or a finished result explaining why not.
@@ -656,6 +692,43 @@ async function dataBackend(args) {
  * is copyable by the user, and neither a SQL string nor a result belongs in it.
  */
 async function orgFetch(port, path, method, body, hint) {
+  const r = await orgFetchOnce(port, path, method, body, hint);
+  if (r.reauth === undefined) return r;
+
+  // The credential lapsed mid-question and the backend has already put the
+  // sign-in page on screen. Where the user's session at the hub is still alive
+  // that is a tab flash, so waiting here and retrying costs one slow answer
+  // instead of a wasted model turn every hour.
+  const back = await awaitReconnect(port, r.reauth);
+  if (!back) return { fail: textResult(data.reauthPendingText(r.reauth), { status: "reauth_started", org_id: r.reauth }) };
+
+  const again = await orgFetchOnce(port, path, method, body, hint);
+  // Once only. A second expiry inside two minutes means something else is
+  // wrong, and looping on it would burn the whole tool timeout in silence.
+  if (again.reauth !== undefined) {
+    return { fail: textResult(data.reauthPendingText(again.reauth), { status: "reauth_started", org_id: again.reauth }) };
+  }
+  return again;
+}
+
+/** Poll until that org reports connected, or give up. Nothing here reads a
+ * credential — /api/org/status never returns one. */
+async function awaitReconnect(port, orgId) {
+  if (!orgId) return false; // nothing to watch for; say so now rather than in two minutes
+  const deadline = Date.now() + data.REAUTH_TIMEOUT_MS;
+  for (;;) {
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/api/org/status`);
+      if (res.ok && data.orgConnected(await res.json(), orgId)) return true;
+    } catch {
+      /* the backend may be busy serving the callback; keep waiting */
+    }
+    if (Date.now() >= deadline) return false;
+    await new Promise((r) => setTimeout(r, data.REAUTH_POLL_MS));
+  }
+}
+
+async function orgFetchOnce(port, path, method, body, hint) {
   const init = { method: method || "GET", headers: {} };
   if (body !== undefined) {
     init.headers["Content-Type"] = "application/json";
@@ -685,6 +758,11 @@ async function orgFetch(port, path, method, body, hint) {
   // version gate above should already have caught this; if it did not, the
   // version is lying and the remedy is still an update.
   if (res.status === 404 && !json) return { fail: textResult(data.UPGRADE_TEXT, { status: "needs_update" }) };
+
+  // The backend cleared the stale credential and opened the sign-in page
+  // itself. Handled by the caller, which waits for the user to finish and runs
+  // the call again — the model is not told about any of it.
+  if (json && json.status === "reauth_started") return { reauth: String(json.org_id || "") };
 
   // The org's credential lapsed. Not an error — an instruction: the whole point
   // of the personal credential expiring is that reconnecting is one tool call.
@@ -773,8 +851,30 @@ async function dataTool(name, args) {
   const ready = await dataBackend(args);
   if (ready.blocked) return ready.blocked;
   const { projectRoot, port } = ready;
+  const out = await relayDataTool(name, args, projectRoot, port);
 
+  // vibefoundry_rules already IS the rules — attaching them again would send
+  // the same markdown twice — but the model has now read them, so it counts.
+  // Only when rules actually came back, though: a relay that failed without
+  // setting isError would otherwise mark them delivered and the auto-attach
+  // would stay off for the rest of the conversation.
+  if (name === data.RULES_TOOL_NAME) {
+    const text = !out.isError && Array.isArray(out.content) && out.content[0]
+      ? String(out.content[0].text || "")
+      : "";
+    if (text.includes("# Track 0")) RULES_ATTACHED = true;
+    return out;
+  }
+  return attachRules(port, out);
+}
+
+async function relayDataTool(name, args, projectRoot, port) {
   if (name === "connect_organization") return connectOrganization(args, projectRoot, port);
+
+  if (name === data.RULES_TOOL_NAME) {
+    const r = await orgFetch(port, "/api/rules");
+    return r.fail || data.rulesResult(r.json);
+  }
 
   if (name === "data_catalog") {
     const r = await orgFetch(port, "/api/org/catalog");
@@ -811,8 +911,12 @@ async function dataTool(name, args) {
   const body = { org_id: orgId, table_id: tableId };
   if (args && args.sql) body.sql = String(args.sql);
   if (args && args.filename) body.filename = String(args.filename);
+  // Only sent when the model named one: without it the backend keeps landing
+  // cuts in input_folder/, which is what every existing project expects.
+  const script = String((args && args.script_name) || "").trim();
+  if (script) body.script_name = script;
   const r = await orgFetch(port, "/api/org/pull", "POST", body);
-  return r.fail || data.pullResult(r.json, { org_id: orgId, table_id: tableId });
+  return r.fail || data.pullResult(r.json, { org_id: orgId, table_id: tableId, script_name: script || null });
 }
 
 // --- vf_request ---------------------------------------------------------------
@@ -1081,7 +1185,13 @@ async function handle(msg) {
       const name = params.name;
       const args = params.arguments || {};
       try {
-        if (name === "open_vibefoundry") return result(id, await openVibeFoundry(args));
+        if (name === "open_vibefoundry") {
+          // Usually the first VibeFoundry call of a conversation, so it is
+          // usually the one carrying the rules. Only once it has a port: a
+          // "not installed" result has no backend to ask.
+          const r = await openVibeFoundry(args);
+          return result(id, await attachRules(r.structuredContent && r.structuredContent.port, r));
+        }
         if (data.DATA_TOOL_NAMES.has(name)) return result(id, await dataTool(name, args));
         if (name === "setup_vibefoundry") {
           // Staged: each call performs ONE step and returns, so the model puts

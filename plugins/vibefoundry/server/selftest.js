@@ -28,6 +28,7 @@ const EXPECTED_TOOLS = [
   "data_schema",
   "data_query",
   "data_pull",
+  "vibefoundry_rules",
   "vf_request",
 ];
 
@@ -39,11 +40,19 @@ const EXPECTED_TOOLS = [
 // adoption, the version gate, the relay and the shaping of the result — and
 // stops exactly where the plugin's responsibility does.
 const STUB = {
-  version: "0.5.0",
+  version: "0.6.0",
   folder: fs.mkdtempSync(path.join(os.tmpdir(), "vf-stub-")),
   server: null,
   port: null,
+  // Set when a query has been answered with reauth_started, so the retry that
+  // follows the sign-in gets real rows — one expiry, one recovery.
+  reauthPending: false,
+  rulesServed: 0,
 };
+
+// Stands in for the Track 0 section of AGENTS.md. The marker is what the
+// auto-attach checks look for, so it must not appear anywhere else.
+const STUB_RULES = "# Track 0 — RULEBOOK-MARKER\n\nScripts go in app_folder/scripts/{script_name}/.";
 
 function stubBody(url, body) {
   const sql = String((body && body.sql) || "");
@@ -52,8 +61,32 @@ function stubBody(url, body) {
       return { status: "ok", version: STUB.version, project_folder: STUB.folder, pane_mode: false };
     case url === "/api/ui/pane":
       return { status: "ok", pane_mode: true };
+    case url === "/api/rules":
+      STUB.rulesServed++;
+      return { source: "project", markdown: STUB_RULES, bytes: STUB_RULES.length };
     case url === "/api/org/list":
       return { orgs: [{ org_id: "acme", name: "Acme", connected: true, email: "p@acme.com" }] };
+    // Mirrors the backend exactly: {"organizations": [...]}, keyed org_id, with
+    // no `connected` flag — presence is connectedness, because an expired
+    // credential is pruned before the reply is built. A stub kinder than the
+    // real shape is what let orgConnected() ship reading a key that has never
+    // existed, so this one is copied from _org_public_view field for field.
+    case url === "/api/org/status":
+      return {
+        organizations: [
+          {
+            org_id: "acme",
+            org_name: "Acme",
+            hub_url: "https://hub.acme.test",
+            gateway: "https://gw.acme.test",
+            email: "p@acme.com",
+            expires: "2099-01-01T00:00:00Z",
+            seconds_to_expiry: 3600,
+            connected_at: "2026-01-01T00:00:00Z",
+            tables: 2,
+          },
+        ],
+      };
     case url === "/api/org/connect":
       return { status: "opened" };
     case url === "/api/org/catalog":
@@ -75,6 +108,9 @@ function stubBody(url, body) {
       };
     case url === "/api/org/query" && /EXPIRED/.test(sql):
       return { status: "reauth_required", org_id: "acme" };
+    case url === "/api/org/query" && /REAUTH/.test(sql) && !STUB.reauthPending:
+      STUB.reauthPending = true;
+      return { status: "reauth_started", org_id: "acme", url: "http://127.0.0.1:1/connect" };
     case url === "/api/org/query" && /BADCOL/.test(sql):
       return { __status: 400, detail: "ColumnNotFound: nope" };
     case url === "/api/org/query": {
@@ -213,7 +249,7 @@ function check(label, ok, detail) {
   const tools = await call("tools/list", {});
   const names = (tools.result?.tools || []).map((t) => t.name);
   check(
-    "exposes exactly the 8 tools",
+    "exposes exactly the 9 tools",
     names.length === EXPECTED_TOOLS.length && EXPECTED_TOOLS.every((n) => names.includes(n)),
     names.join(", ")
   );
@@ -226,13 +262,22 @@ function check(label, ok, detail) {
   check("connect_organization is linked to the widget", connect?._meta?.["openai/outputTemplate"] === "ui://widget/vibefoundry.html");
   check(
     "the querying tools carry no widget",
-    ["data_catalog", "data_schema", "data_query", "data_pull"].every(
+    ["data_catalog", "data_schema", "data_query", "data_pull", "vibefoundry_rules"].every(
       (n) => !(tools.result?.tools || []).find((t) => t.name === n)?._meta
     )
   );
   const q = (tools.result?.tools || []).find((t) => t.name === "data_query");
   check("data_query tells the model to profile first and never SELECT *",
     /data_schema/.test(q?.description || "") && /SELECT \*/.test(q?.description || ""));
+  // The description is a prompt: a model that thinks it must fetch the rules
+  // will call this every turn, which is the cost the auto-attach exists to
+  // avoid.
+  const rules = (tools.result?.tools || []).find((t) => t.name === "vibefoundry_rules");
+  check("vibefoundry_rules says the rules normally arrive on their own",
+    /do NOT need to call this/.test(rules?.description || "") && /automatic|on their own/i.test(rules?.description || ""));
+  const pullTool = (tools.result?.tools || []).find((t) => t.name === "data_pull");
+  check("data_pull can land a cut in a script's raw_pulls/",
+    /raw_pulls/.test(pullTool?.inputSchema?.properties?.script_name?.description || ""));
 
   // Dry-run + the announce call only: the real steps install software, which a
   // selftest must not. The announce call is safe by design — the first call
@@ -296,7 +341,7 @@ function check(label, ok, detail) {
   const bareFolder = fs.mkdtempSync(path.join(os.tmpdir(), "vf-bare-"));
   const btools = await bcall("tools/list", {});
   const bnames = (btools.result?.tools || []).map((t) => t.name);
-  check("bare machine still advertises all 8 tools", bnames.length === EXPECTED_TOOLS.length, bnames.join(", "));
+  check("bare machine still advertises all 9 tools", bnames.length === EXPECTED_TOOLS.length, bnames.join(", "));
   const bcat = await bcall("tools/call", { name: "data_catalog", arguments: { projectRoot: bareFolder } });
   check(
     "data_catalog on a bare machine points at setup rather than failing",
@@ -375,12 +420,19 @@ function check(label, ok, detail) {
 
     const cat = await dcall("data_catalog", {});
     const ctext = cat.result?.content?.[0]?.text || "";
+    // Nothing with a backend has been called in this process yet, so this is
+    // the result the rules must ride on.
+    check("the first backend-backed tool result carries the project rules",
+      ctext.startsWith("# Track 0 — RULEBOOK-MARKER"), ctext.split("\n")[0]);
     check("data_catalog reads as a list, not as JSON", /outlet_universe/.test(ctext) && /12,345 rows/.test(ctext), ctext.split("\n")[1]);
     check("data_catalog groups by org_id so the model can pass it back", /org_id "acme"/.test(ctext) && /org_id "public"/.test(ctext));
     check("data_catalog carries the full list in structuredContent", (cat.result?.structuredContent?.tables || []).length === 2);
 
     const sch = await dcall("data_schema", { org_id: "acme", table_id: "outlet_universe" });
     const stext = sch.result?.content?.[0]?.text || "";
+    // Once per conversation, not once per call: repeating a rulebook on every
+    // result costs more context than the answers do.
+    check("the rules do not ride along a second time", !/RULEBOOK-MARKER/.test(stext), stext.split("\n")[0]);
     check("data_schema names the real columns and their notes", /\| state \|/.test(stext) && /Two-letter US state/.test(stext));
     check("data_schema surfaces the refresh date to cite", /2026-08-21/.test(stext));
 
@@ -412,10 +464,34 @@ function check(label, ok, detail) {
       gone.result?.structuredContent?.status === "reauth_required" && /connect_organization/.test(gone.result?.content?.[0]?.text || ""),
       gone.result?.content?.[0]?.text);
 
+    // An expired credential the backend is already re-opening the browser for.
+    // The plugin waits it out and runs the query again, so the model sees the
+    // answer rather than an errand.
+    const rauth = await dcall("data_query", { org_id: "acme", sql: "SELECT REAUTH FROM outlet_universe" });
+    check("an expired credential re-authenticates and the query is retried once",
+      rauth.result?.structuredContent?.status === "ok" && rauth.result?.structuredContent?.row_count === 2,
+      rauth.result?.content?.[0]?.text?.split("\n").pop());
+
     const pull = await dcall("data_pull", { org_id: "acme", table_id: "outlet_universe", sql: "SELECT state FROM outlet_universe" });
     check("data_pull reports where the file landed",
       /cut\.parquet/.test(pull.result?.content?.[0]?.text || "") && !!pull.result?.structuredContent?.path,
       pull.result?.content?.[0]?.text);
+
+    const spull = await dcall("data_pull", { org_id: "acme", table_id: "outlet_universe", script_name: "georgia_top_accounts" });
+    check("data_pull passes script_name through and says where it landed",
+      spull.result?.structuredContent?.script_name === "georgia_top_accounts" &&
+        /raw_pulls\//.test(spull.result?.content?.[0]?.text || ""),
+      spull.result?.content?.[0]?.text);
+
+    const rl = await dcall("vibefoundry_rules", {});
+    const rtext = rl.result?.content?.[0]?.text || "";
+    check("vibefoundry_rules relays the rulebook and says whose it is",
+      /RULEBOOK-MARKER/.test(rtext) && rl.result?.structuredContent?.source === "project",
+      rtext.split("\n")[0]);
+    // Seen from the backend: one fetch for the attach, one for the explicit
+    // call. A tool result that quietly re-fetches is the failure this catches.
+    check("the rules were fetched once for the attach, once on request",
+      STUB.rulesServed === 2, `${STUB.rulesServed} fetch(es)`);
 
     const conn = await dcall("connect_organization", {});
     check("connect_organization lists the orgs and keeps the widget on the result",
@@ -427,15 +503,16 @@ function check(label, ok, detail) {
         !/api key|app_?id|secret|\.env/i.test(conn2.result?.content?.[0]?.text || ""),
       conn2.result?.content?.[0]?.text);
 
-    // A backend that predates /api/org/* must be told to update rather than be
-    // asked a question it will answer with a 404 page.
-    STUB.version = "0.4.23";
+    // A backend that predates /api/rules must be told to update rather than be
+    // asked a question it will answer with a 404 page. 0.5.0 served /api/org/*
+    // but not the rules, so it is the version that proves the gate moved.
+    STUB.version = "0.5.0";
     const old = await dcall("data_catalog", {});
-    check("an old backend is sent to setup_vibefoundry, not queried",
+    check("a backend older than 0.6.0 is sent to setup_vibefoundry, not queried",
       old.result?.structuredContent?.status === "needs_update" &&
         /setup_vibefoundry/.test(old.result?.content?.[0]?.text || ""),
       old.result?.content?.[0]?.text);
-    STUB.version = "0.5.0";
+    STUB.version = "0.6.0";
 
     // Nothing the data tools did may reach the buffer the user can copy.
     const after = await call("tools/call", { name: "vf_request", arguments: { path: "/__plugin/log" } });

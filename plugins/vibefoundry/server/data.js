@@ -2,7 +2,7 @@
 /*
  * Track 0 — answering questions about the user's own data.
  *
- * The tool definitions and the result shaping for the five data tools. The
+ * The tool definitions and the result shaping for the six data tools. The
  * relaying itself lives in index.js because it needs the same folder resolution
  * and backend adoption every other tool uses.
  *
@@ -13,15 +13,46 @@
  * user, and a SQL string with a customer name in it does not belong in it.
  */
 
-// The backend release that first served /api/org/*. Older ones answer 404, or
-// worse answer something else on the same path, so this is checked against
-// /api/health BEFORE any org call rather than after one fails.
-const MIN_BACKEND_VERSION = "0.5.0";
+// The backend release that first served /api/rules and re-authenticated itself.
+// Older ones answer 404, or worse answer something else on the same path, so
+// this is checked against /api/health BEFORE any org call rather than after one
+// fails.
+const MIN_BACKEND_VERSION = "0.6.0";
 
 const UPGRADE_TEXT =
   "VibeFoundry needs an update before it can answer questions about data — tell " +
   'the user to say "set me up to vibe code" and call setup_vibefoundry, then try ' +
   "this again.";
+
+// A personal credential lasts an hour, so an afternoon's work crosses at least
+// one expiry. The backend re-opens the sign-in page itself; these are how long
+// the plugin is willing to stand there waiting for the user to finish it. The
+// host's tool timeout is 1800s, so 120 is nowhere near it.
+const REAUTH_TIMEOUT_MS = 120 * 1000;
+const REAUTH_POLL_MS = 1500;
+
+function reauthPendingText(orgId) {
+  return (
+    `The connection to ${orgId || "that organization"} expired, so VibeFoundry opened the ` +
+    "sign-in page in the user's browser. It is still waiting there — tell them to finish " +
+    "signing in, then ask me again and I'll run this."
+  );
+}
+
+/** Did that org come back connected? /api/org/status is shaped by the python
+ * package and has been a list and a map at different points; both are read here
+ * rather than betting the poll on one of them. */
+function orgConnected(json, orgId) {
+  // /api/org/status answers {"organizations": [...]} and prunes expired
+  // credentials before replying, so presence in that list IS connectedness —
+  // there is no per-entry flag to read. This read `json.orgs`, a shape the
+  // backend has never returned, so it was always false and awaitReconnect()
+  // polled for the full two minutes on every re-auth instead of retrying.
+  // One documented shape, read directly: a tolerant chain is what hid this.
+  if (!json || !orgId) return false;
+  const list = json.organizations;
+  return Array.isArray(list) && list.some((o) => o && String(o.org_id) === orgId);
+}
 
 // What crosses the bridge, and why the two numbers differ. The text is read by
 // a model in one glance, so 50 rows is already more than an answer needs; the
@@ -222,16 +253,44 @@ const PULL_TOOL = {
         type: "string",
         description: "Optional name for the file in input_folder/. Defaults to the table id.",
       },
+      script_name: {
+        type: "string",
+        description:
+          "The script folder this pull belongs to, when you are building one. The cut " +
+          "lands in app_folder/scripts/<script_name>/raw_pulls/ instead of input_folder/, " +
+          "beside the steps that read it. Omit it only when the file is for the project " +
+          "at large rather than for one script.",
+      },
     },
     required: ["projectRoot", "org_id", "table_id"],
   },
   annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true, readOnlyHint: false },
 };
 
-/** The five tools, with the pane widget attached to the only one that shows a
+const RULES_TOOL = {
+  name: "vibefoundry_rules",
+  title: "VibeFoundry Project Rules",
+  description:
+    "Re-read the rules for working in a VibeFoundry project: where a script, the " +
+    "data it pulls and the answer it produces each belong. You normally do NOT " +
+    "need to call this — the rules arrive on their own, attached to the first " +
+    "VibeFoundry tool result of the conversation. Call it when that was many turns " +
+    "ago and you are about to build or change something, or when you are unsure " +
+    "where a file belongs. It returns the project's own rulebook when the project " +
+    "has one, so what comes back is this project's rules rather than a remembered " +
+    "version of them.",
+  inputSchema: {
+    type: "object",
+    properties: { projectRoot: PROJECT_ROOT_PROPERTY },
+    required: ["projectRoot"],
+  },
+  annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: true, readOnlyHint: true },
+};
+
+/** The six tools, with the pane widget attached to the only one that shows a
  * pane. `widgetMeta` comes from index.js, which owns the widget URIs. */
 function dataTools(widgetMeta) {
-  return [{ ...CONNECT_TOOL, _meta: widgetMeta }, CATALOG_TOOL, SCHEMA_TOOL, QUERY_TOOL, PULL_TOOL];
+  return [{ ...CONNECT_TOOL, _meta: widgetMeta }, CATALOG_TOOL, SCHEMA_TOOL, QUERY_TOOL, PULL_TOOL, RULES_TOOL];
 }
 
 const DATA_TOOL_NAMES = new Set([
@@ -240,7 +299,10 @@ const DATA_TOOL_NAMES = new Set([
   SCHEMA_TOOL.name,
   QUERY_TOOL.name,
   PULL_TOOL.name,
+  RULES_TOOL.name,
 ]);
+
+const RULES_TOOL_NAME = RULES_TOOL.name;
 
 // --- shaping a result a model can read ----------------------------------------
 
@@ -452,29 +514,69 @@ function queryResult(json, meta) {
 function pullResult(json, meta) {
   const path = json.path || json.file || json.saved_to || json.output_path || null;
   const rowCount = json.row_count ?? json.rows ?? null;
+  const where = meta.script_name ? `${meta.script_name}'s raw_pulls/` : "input_folder/";
   if (!path) {
     return say(
       `Pulled ${meta.table_id} from ${meta.org_id}, but the backend did not report where it landed. ` +
-        "Check input_folder/ in the pane.",
+        `Check ${where} in the pane.`,
       { status: "ok", ...json, org_id: meta.org_id, table_id: meta.table_id }
     );
   }
   return say(
     `Saved ${rowCount !== null ? `${num(rowCount)} rows` : meta.table_id} to ${path}. ` +
-      "Scripts read it from input_folder/ — never modify it there, write results to output_folder/. " +
-      "If the user only wanted an answer rather than a file, use data_query instead.",
-    { status: "ok", org_id: meta.org_id, table_id: meta.table_id, path, row_count: rowCount }
+      (meta.script_name
+        ? `It belongs to the ${meta.script_name} script — its steps read it from raw_pulls/ and write ` +
+          "the answer into final_output/."
+        : "Scripts read it from input_folder/ — never modify it there, write results to output_folder/. " +
+          "If the user only wanted an answer rather than a file, use data_query instead."),
+    {
+      status: "ok",
+      org_id: meta.org_id,
+      table_id: meta.table_id,
+      path,
+      row_count: rowCount,
+      ...(meta.script_name ? { script_name: meta.script_name } : {}),
+    }
   );
+}
+
+/** The rulebook, verbatim: it is markdown written for a model, so shaping it
+ * would only damage it. `source` says whose rules these are — the project's own
+ * AGENTS.md beats ours, and that distinction is worth stating. */
+function rulesResult(json) {
+  const md = String((json && json.markdown) || "").trim();
+  if (!md) {
+    return say(
+      "VibeFoundry returned no rules for this project. Follow the project's AGENTS.md if it has one.",
+      { status: "empty" }
+    );
+  }
+  const source =
+    json.source === "project"
+      ? "This project's own AGENTS.md."
+      : json.source === "remote"
+        ? "VibeFoundry's current rulebook."
+        : "VibeFoundry's built-in rules (the full rulebook could not be reached).";
+  return {
+    content: [{ type: "text", text: `${source}\n\n${md}` }],
+    structuredContent: { status: "ok", source: json.source || null, bytes: json.bytes ?? md.length, markdown: md },
+  };
 }
 
 module.exports = {
   MIN_BACKEND_VERSION,
   UPGRADE_TEXT,
   DATA_TOOL_NAMES,
+  RULES_TOOL_NAME,
+  REAUTH_TIMEOUT_MS,
+  REAUTH_POLL_MS,
+  reauthPendingText,
+  orgConnected,
   dataTools,
   versionAtLeast,
   catalogResult,
   schemaResult,
   queryResult,
   pullResult,
+  rulesResult,
 };
