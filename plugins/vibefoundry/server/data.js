@@ -228,11 +228,15 @@ const PULL_TOOL = {
   name: "data_pull",
   title: "Pull Data Into The Project",
   description:
-    "Land the rows a question needs on disk. This is the normal way to answer a " +
-    "question: VibeFoundry answers by building a small script, and this is the " +
-    "step that fetches its input. Pass `script_name` and the cut lands in " +
-    "app_folder/scripts/<script_name>/raw_pulls/, where the steps you write next " +
-    "will read it; omit it and the cut goes to input_folder/ for a Track 1–4 app. " +
+    "Land the rows a question needs on disk, and create the script folder to hold " +
+    "them. This is the normal way to answer a question: VibeFoundry answers by " +
+    "building a small script, and this call is what starts it. Pass `script_name` " +
+    "(the name you chose) and the cut lands in " +
+    "app_folder/scripts/<script_name>/raw_pulls/ — the call creates that folder " +
+    "with raw_pulls/, steps/ and final_output/, writes vf.py at its root and a " +
+    "steps/step1_pull.py stub. Never make the folder by hand: without vf.py the " +
+    "steps cannot run. Omit `script_name` and the cut goes to input_folder/ for a " +
+    "Track 1–4 app. " +
     "ALWAYS pass a `sql` SELECT so only the rows and columns the question needs " +
     "cross the wire — call data_schema first and name the columns, filter and " +
     "aggregate in SQL. Omit `sql` only when the whole table genuinely is the " +
