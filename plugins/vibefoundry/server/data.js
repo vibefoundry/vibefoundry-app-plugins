@@ -186,17 +186,17 @@ const QUERY_TOOL = {
   name: "data_query",
   title: "Query Data",
   description:
-    "Answer a question about the user's data by running one read-only SQL SELECT " +
-    "where the data lives and getting the rows back. This is how questions get " +
-    "answered — use it instead of downloading a table, instead of writing a " +
-    "script, and instead of answering from memory. Call data_schema on every " +
-    "table you reference first, then write the NARROWEST query that answers the " +
-    "question: name only the columns you need, do the filtering and the " +
-    "aggregation in SQL, and add an ORDER BY and a LIMIT. Never write SELECT * — " +
-    "a whole table is not an answer, and pulling one is slow and wasteful. One " +
-    "statement only: no comments, no semicolon-separated statements, no writes or " +
-    "DDL of any kind. Report the answer in the chat and say which table it came " +
-    "from.",
+    "Run one read-only SQL SELECT where the data lives and get the rows back. Use " +
+    "it to CHECK something while you build — that a filter matches, that a column " +
+    "holds what data_schema implied, that a number looks sane. It is not how a " +
+    "question gets answered: VibeFoundry answers by building a small script, so " +
+    "the rows a question needs come down through data_pull into raw_pulls/, and " +
+    "the answer you report is what the script wrote into final_output/. Call " +
+    "data_schema on every table you reference first, then write the NARROWEST " +
+    "query: name only the columns you need, filter and aggregate in SQL, add an " +
+    "ORDER BY and a LIMIT. Never write SELECT * — a whole table is not an answer, " +
+    "and pulling one is slow and wasteful. One statement only: no comments, no " +
+    "semicolon-separated statements, no writes or DDL of any kind.",
   inputSchema: {
     type: "object",
     properties: {
@@ -228,12 +228,16 @@ const PULL_TOOL = {
   name: "data_pull",
   title: "Pull Data Into The Project",
   description:
-    "Save a cut of a table into the project's input_folder/ so a Track 1–4 app " +
-    "can read it from disk. Call this only when the user is BUILDING something " +
-    "that needs the rows locally — a pipeline, a dashboard, an agent. To answer a " +
-    "question, use data_query instead; this tool writes a file and answers " +
-    "nothing. Pass a `sql` SELECT so only the rows and columns the app needs land " +
-    "on disk, and omit it only when the app genuinely needs the whole table.",
+    "Land the rows a question needs on disk. This is the normal way to answer a " +
+    "question: VibeFoundry answers by building a small script, and this is the " +
+    "step that fetches its input. Pass `script_name` and the cut lands in " +
+    "app_folder/scripts/<script_name>/raw_pulls/, where the steps you write next " +
+    "will read it; omit it and the cut goes to input_folder/ for a Track 1–4 app. " +
+    "ALWAYS pass a `sql` SELECT so only the rows and columns the question needs " +
+    "cross the wire — call data_schema first and name the columns, filter and " +
+    "aggregate in SQL. Omit `sql` only when the whole table genuinely is the " +
+    "input. A whole-table pull to answer one question is the thing this tool " +
+    "exists to avoid.",
   inputSchema: {
     type: "object",
     properties: {

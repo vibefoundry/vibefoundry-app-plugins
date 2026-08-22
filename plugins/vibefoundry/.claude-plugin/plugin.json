@@ -1,6 +1,6 @@
 {
   "name": "vibefoundry",
-  "version": "0.11.0",
+  "version": "0.11.1",
   "description": "Sets up and opens the VibeFoundry data-science IDE as a pane, and answers questions about your organization's data by querying it where it lives \u2014 installs everything it needs itself, then launches it in a terminal exactly as you would yourself.",
   "author": {
     "name": "VibeFoundry",
