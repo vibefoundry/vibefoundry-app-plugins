@@ -22,6 +22,7 @@ const { discover, stop } = require("./instances");
 const { launch, paneHtmlPath, isInstalled, sameFolder } = require("./launch");
 const { setupCall, getProgressState } = require("./setup");
 const { writeLaunchConfig, startProgressServer } = require("./claude");
+const data = require("./data");
 
 /** Which host is on the other end. Decided once, at initialize, from the name
  * the client gives for itself — the ONLY place the two hosts differ is how the
@@ -129,7 +130,16 @@ const INSTRUCTIONS =
   "reports a failed step, relay its message to the user verbatim and stop — " +
   "never edit shell profiles, never modify PATH, never diagnose with your own " +
   "commands: re-running setup_vibefoundry is the only remedy you may offer. " +
-  "Never call vf_request yourself: it exists only for the pane UI.";
+  "Never call vf_request yourself: it exists only for the pane UI. " +
+  "When the user asks a QUESTION about their own data — what is in it, how much, " +
+  "which, when, a total, a comparison, a ranking — answer it with the data tools " +
+  "rather than from memory and rather than by writing a script: data_catalog to " +
+  "find the table, data_schema to read its real columns, then data_query to run " +
+  "one narrow SQL SELECT and report the answer in the chat. Reach for data_pull " +
+  "only when the user is BUILDING something that needs the rows on disk. If any " +
+  "of them reports that no organization is connected, call connect_organization. " +
+  "Never ask the user for an API key, an app id, a secret or a .env file: the " +
+  "plugin holds no credentials and never needs one from the chat.";
 
 // Appended for Claude Code, where the pane is the Preview attaching by config
 // name rather than a widget.
@@ -420,17 +430,18 @@ function plural(n, word) {
   return `${n} ${word}${n === 1 ? "" : "s"}`;
 }
 
+// Every tool that needs a folder refuses with the same words, so the user reads
+// one warning rather than a family of near-identical ones.
+const NO_WORKSPACE =
+  "Please Choose A Working Directory First. " +
+  "No workspace folder is selected — relay this warning to the user verbatim, " +
+  "and once they name a folder, call this tool again with it as projectRoot.";
+
 async function openVibeFoundry(args) {
   const hint = String((args && args.projectRoot) || "").trim() || null;
   const resolved = await resolveProjectRoot(hint);
   const projectRoot = resolved.path;
-  if (!projectRoot) {
-    throw new Error(
-      "Please Choose A Working Directory First. " +
-        "No workspace folder is selected — relay this warning to the user verbatim, " +
-        "and once they name a folder, call this tool again with it as projectRoot."
-    );
-  }
+  if (!projectRoot) throw new Error(NO_WORKSPACE);
 
   let stat;
   try {
@@ -578,6 +589,230 @@ async function paneHandoff(projectRoot, port) {
 
 function textResult(text, structured) {
   return { content: [{ type: "text", text }], structuredContent: structured || {} };
+}
+
+// --- the data tools -----------------------------------------------------------
+// Same preamble for all five: resolve the folder the way open_vibefoundry does,
+// make sure a backend is serving THAT folder, and refuse a backend too old to
+// have /api/org/*. Only then does anything get relayed.
+
+const DATA_TOOLS = data.dataTools(TOOL_META);
+
+/**
+ * A backend on the requested folder, or a finished result explaining why not.
+ *
+ * Discovery comes before the install probe on purpose: a backend answering
+ * /api/health on this folder is proof the package is installed, and the probe
+ * behind it shells out through a login shell, which is the slowest thing in
+ * here.
+ */
+async function dataBackend(args) {
+  const hint = String((args && args.projectRoot) || "").trim() || null;
+  const resolved = await resolveProjectRoot(hint);
+  const projectRoot = resolved.path;
+  if (!projectRoot) throw new Error(NO_WORKSPACE);
+
+  let stat;
+  try {
+    stat = fs.statSync(projectRoot);
+  } catch {
+    throw new Error(`That folder does not exist: ${projectRoot}`);
+  }
+  if (!stat.isDirectory()) throw new Error(`Not a directory: ${projectRoot}`);
+
+  LAST_PROJECT_ROOT = projectRoot;
+  let instance = (await discover()).find((i) => sameFolder(i.folder, projectRoot));
+  if (!instance) {
+    if (!(await isInstalled())) {
+      return {
+        blocked: textResult(
+          "VibeFoundry is not installed on this machine, so there is nothing to query " +
+            "yet. Call setup_vibefoundry to install it (it handles everything itself), " +
+            "then try again.",
+          { status: "not_installed" }
+        ),
+      };
+    }
+    const launched = await launch(projectRoot);
+    if (!launched.ok) {
+      return { blocked: textResult(`Could not open VibeFoundry: ${launched.error}`, { status: "launch_failed", error: launched.error }) };
+    }
+    instance = launched;
+  }
+
+  BACKEND = `http://127.0.0.1:${instance.port}`;
+  if (!data.versionAtLeast(instance.version, data.MIN_BACKEND_VERSION)) {
+    return { blocked: textResult(data.UPGRADE_TEXT, { status: "needs_update", version: instance.version || null }) };
+  }
+  return { projectRoot, port: instance.port, version: instance.version };
+}
+
+/**
+ * One call to the backend's /api/org/* surface.
+ *
+ * 127.0.0.1 by construction — the plugin has no gateway URL and no credential,
+ * and the python package that owns both is the only thing that ever leaves the
+ * machine. Nothing here reaches note(): the ring buffer behind the Logs button
+ * is copyable by the user, and neither a SQL string nor a result belongs in it.
+ */
+async function orgFetch(port, path, method, body, hint) {
+  const init = { method: method || "GET", headers: {} };
+  if (body !== undefined) {
+    init.headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(body);
+  }
+
+  let res;
+  try {
+    res = await fetch(`http://127.0.0.1:${port}${path}`, init);
+  } catch {
+    return {
+      fail: textResult('The VibeFoundry backend stopped responding. Say "open VibeFoundry" and try again.', {
+        status: "backend_gone",
+      }),
+    };
+  }
+
+  const text = await res.text();
+  let json = null;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    /* handled below — a non-JSON body from /api/org/* is always a failure */
+  }
+
+  // A route that does not exist answers with the app's HTML 404, not JSON. The
+  // version gate above should already have caught this; if it did not, the
+  // version is lying and the remedy is still an update.
+  if (res.status === 404 && !json) return { fail: textResult(data.UPGRADE_TEXT, { status: "needs_update" }) };
+
+  // The org's credential lapsed. Not an error — an instruction: the whole point
+  // of the personal credential expiring is that reconnecting is one tool call.
+  if (json && json.status === "reauth_required") {
+    const org = json.org_id || "";
+    return {
+      fail: textResult(
+        `The connection to ${org || "that organization"} has expired. Call connect_organization` +
+          (org ? ` with org_id "${org}"` : "") +
+          " to sign the user in again, then run this again.",
+        { status: "reauth_required", org_id: org || null }
+      ),
+    };
+  }
+
+  if (res.status >= 400 || !json) {
+    const detail = (json && (json.detail || json.error || json.message)) || text.slice(0, 500) || `HTTP ${res.status}`;
+    return {
+      fail: {
+        content: [{ type: "text", text: String(detail) + (hint || "") }],
+        structuredContent: { status: "error", httpStatus: res.status, detail: String(detail) },
+        isError: true,
+      },
+    };
+  }
+  return { json };
+}
+
+/**
+ * Show the Organizations panel and start the browser sign-in.
+ *
+ * The pane handoff is the same one open_vibefoundry does — on Codex the widget
+ * on this tool's definition puts the panel on screen, on Claude the model calls
+ * preview_start with the config name returned here.
+ */
+async function connectOrganization(args, projectRoot, port) {
+  const orgId = String((args && args.org_id) || "").trim();
+  const pane = await paneHandoff(projectRoot, port);
+
+  if (!orgId) {
+    const r = await orgFetch(port, "/api/org/list");
+    if (r.fail) return r.fail;
+    const orgs = Array.isArray(r.json) ? r.json : r.json.orgs || [];
+    const lines = orgs.map((o) => {
+      const id = o.org_id || o.id;
+      const where = o.connected ? ` — already connected${o.email ? ` as ${o.email}` : ""}` : "";
+      return `  • ${o.name || id} — org_id "${id}"${where}`;
+    });
+    const text = lines.length
+      ? `Organizations available:\n${lines.join("\n")}\n\nThe Organizations panel is open in the pane — ` +
+        "the user can connect from there, or tell me which one and I'll call connect_organization with its org_id."
+      : "This build of VibeFoundry has no organizations bundled with it. The user's " +
+        "administrator supplies the hub address.";
+    return {
+      content: [{ type: "text", text: text + pane.text }],
+      structuredContent: { status: "ok", orgs, ...pane.fields },
+      _meta: TOOL_META,
+    };
+  }
+
+  const r = await orgFetch(port, "/api/org/connect", "POST", { org_id: orgId });
+  if (r.fail) return r.fail;
+  return {
+    content: [
+      {
+        type: "text",
+        text:
+          `Opening ${orgId}'s sign-in page in the user's browser. Tell them to finish ` +
+          "signing in there — the connection completes itself and no key ever comes back " +
+          "through the chat. Then call data_catalog to see what they can query." +
+          pane.text,
+      },
+    ],
+    structuredContent: { status: r.json.status || "opened", org_id: orgId, ...pane.fields },
+    _meta: TOOL_META,
+  };
+}
+
+function required(args, key, tool) {
+  const v = String((args && args[key]) || "").trim();
+  if (!v) throw new Error(`${tool} needs ${key}. Call data_catalog first — it returns the ids these tools take.`);
+  return v;
+}
+
+async function dataTool(name, args) {
+  const ready = await dataBackend(args);
+  if (ready.blocked) return ready.blocked;
+  const { projectRoot, port } = ready;
+
+  if (name === "connect_organization") return connectOrganization(args, projectRoot, port);
+
+  if (name === "data_catalog") {
+    const r = await orgFetch(port, "/api/org/catalog");
+    return r.fail || data.catalogResult(r.json);
+  }
+
+  if (name === "data_schema") {
+    const orgId = required(args, "org_id", "data_schema");
+    const tableId = required(args, "table_id", "data_schema");
+    const r = await orgFetch(
+      port,
+      `/api/org/schema/${encodeURIComponent(orgId)}/${encodeURIComponent(tableId)}`
+    );
+    return r.fail || data.schemaResult(r.json, orgId, tableId);
+  }
+
+  if (name === "data_query") {
+    const orgId = required(args, "org_id", "data_query");
+    const sql = required(args, "sql", "data_query");
+    const body = { org_id: orgId, sql };
+    if (Number.isFinite(args && args.limit)) body.limit = args.limit;
+    const r = await orgFetch(
+      port,
+      "/api/org/query",
+      "POST",
+      body,
+      " — the query was rejected. Confirm the column names with data_schema, fix the SQL, and call data_query again."
+    );
+    return r.fail || data.queryResult(r.json, { org_id: orgId, sql });
+  }
+
+  const orgId = required(args, "org_id", "data_pull");
+  const tableId = required(args, "table_id", "data_pull");
+  const body = { org_id: orgId, table_id: tableId };
+  if (args && args.sql) body.sql = String(args.sql);
+  if (args && args.filename) body.filename = String(args.filename);
+  const r = await orgFetch(port, "/api/org/pull", "POST", body);
+  return r.fail || data.pullResult(r.json, { org_id: orgId, table_id: tableId });
 }
 
 // --- vf_request ---------------------------------------------------------------
@@ -840,13 +1075,14 @@ async function handle(msg) {
       return result(id, {});
 
     case "tools/list":
-      return result(id, { tools: [OPEN_TOOL, SETUP_TOOL, PROXY_TOOL] });
+      return result(id, { tools: [OPEN_TOOL, SETUP_TOOL, ...DATA_TOOLS, PROXY_TOOL] });
 
     case "tools/call": {
       const name = params.name;
       const args = params.arguments || {};
       try {
         if (name === "open_vibefoundry") return result(id, await openVibeFoundry(args));
+        if (data.DATA_TOOL_NAMES.has(name)) return result(id, await dataTool(name, args));
         if (name === "setup_vibefoundry") {
           // Staged: each call performs ONE step and returns, so the model puts
           // a visible status line in the chat between steps — progress the user

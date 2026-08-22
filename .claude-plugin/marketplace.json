@@ -6,14 +6,14 @@
     "url": "https://vibefoundry.ai"
   },
   "metadata": {
-    "description": "VibeFoundry \u2014 the data-science IDE, set up and launched as an in-app pane.",
-    "version": "0.9.0"
+    "description": "VibeFoundry \u2014 the data-science IDE, set up and launched as an in-app pane, with your organization's data queryable from the chat.",
+    "version": "0.10.0"
   },
   "plugins": [
     {
       "name": "vibefoundry",
       "source": "./plugins/vibefoundry",
-      "description": "Say \"set me up to vibe code\" to install everything, then \"open VibeFoundry\" to launch the IDE as a pane on your current project.",
+      "description": "Say \"set me up to vibe code\" to install everything, then \"open VibeFoundry\" to launch the IDE as a pane on your current project. Connect your organization to ask questions about its data in the chat.",
       "category": "productivity"
     }
   ]

@@ -12,10 +12,109 @@
  */
 
 const { spawn } = require("child_process");
+const fs = require("fs");
+const http = require("http");
+const os = require("os");
 const path = require("path");
 
 const folder = process.argv[2] || process.cwd();
 const doLaunch = process.argv.includes("--launch");
+
+const EXPECTED_TOOLS = [
+  "open_vibefoundry",
+  "setup_vibefoundry",
+  "connect_organization",
+  "data_catalog",
+  "data_schema",
+  "data_query",
+  "data_pull",
+  "vf_request",
+];
+
+// --- a stand-in backend -------------------------------------------------------
+// The data tools relay to /api/org/*, which the python package serves and which
+// in turn talks to a real gateway. Neither can be a test dependency, so this
+// answers /api/health and the org routes itself, on a folder nothing else is
+// serving. It proves the whole path the plugin owns — folder resolution,
+// adoption, the version gate, the relay and the shaping of the result — and
+// stops exactly where the plugin's responsibility does.
+const STUB = {
+  version: "0.5.0",
+  folder: fs.mkdtempSync(path.join(os.tmpdir(), "vf-stub-")),
+  server: null,
+  port: null,
+};
+
+function stubBody(url, body) {
+  const sql = String((body && body.sql) || "");
+  switch (true) {
+    case url === "/api/health":
+      return { status: "ok", version: STUB.version, project_folder: STUB.folder, pane_mode: false };
+    case url === "/api/ui/pane":
+      return { status: "ok", pane_mode: true };
+    case url === "/api/org/list":
+      return { orgs: [{ org_id: "acme", name: "Acme", connected: true, email: "p@acme.com" }] };
+    case url === "/api/org/connect":
+      return { status: "opened" };
+    case url === "/api/org/catalog":
+      return {
+        tables: [
+          { source: "org", org_id: "acme", org_name: "Acme", id: "outlet_universe", title: "Outlet Universe", rows: 12345, columns: ["state", "volume", "outlet"] },
+          { source: "public", org_id: "public", id: "census_tracts", title: "Census Tracts", rows: 74000, columns: ["geoid", "pop"] },
+        ],
+      };
+    case url.startsWith("/api/org/schema/"):
+      return {
+        description: "One row per outlet.",
+        rows: 12345,
+        refreshedAt: "2026-08-21T04:00:00Z",
+        columns: [
+          { name: "state", dtype: "str", nulls: 0, sample_values: ["GA", "TX"], note: "Two-letter US state." },
+          { name: "volume", dtype: "f64", nulls: 3, min: 0, max: 99.5, median: 12 },
+        ],
+      };
+    case url === "/api/org/query" && /EXPIRED/.test(sql):
+      return { status: "reauth_required", org_id: "acme" };
+    case url === "/api/org/query" && /BADCOL/.test(sql):
+      return { __status: 400, detail: "ColumnNotFound: nope" };
+    case url === "/api/org/query": {
+      const n = /BIG/.test(sql) ? 1200 : 2;
+      const rows = [];
+      for (let i = 0; i < n; i++) rows.push([`S${i}`, i * 1.5]);
+      return { columns: ["state", "vol"], rows, row_count: n, truncated: false, tables_used: ["outlet_universe"], elapsed_ms: 41 };
+    }
+    case url === "/api/org/pull":
+      return { status: "ok", path: path.join(STUB.folder, "input_folder", "cut.parquet"), row_count: 2 };
+    default:
+      return { __status: 404, detail: "no such stub route" };
+  }
+}
+
+/** Bind anywhere in the band the plugin scans; null if it is entirely taken. */
+function startStub() {
+  const srv = http.createServer((req, res) => {
+    let raw = "";
+    req.on("data", (c) => (raw += c));
+    req.on("end", () => {
+      let body = null;
+      try { body = JSON.parse(raw); } catch { /* GETs have none */ }
+      const payload = stubBody(req.url.split("?")[0], body);
+      const status = payload.__status || 200;
+      delete payload.__status;
+      res.writeHead(status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(payload));
+    });
+  });
+  return new Promise((resolve) => {
+    let p = 8765;
+    const attempt = () => {
+      if (p > 8864) return resolve(null);
+      srv.once("error", () => { p++; attempt(); });
+      srv.listen(p, "127.0.0.1", () => { STUB.server = srv; STUB.port = p; resolve(p); });
+    };
+    attempt();
+  });
+}
 
 // By default this drives the source through node. Set VF_SERVER_CMD to drive a
 // compiled binary instead — the same checks then certify the artifact that
@@ -114,12 +213,26 @@ function check(label, ok, detail) {
   const tools = await call("tools/list", {});
   const names = (tools.result?.tools || []).map((t) => t.name);
   check(
-    "exposes exactly open_vibefoundry + setup_vibefoundry + vf_request",
-    names.length === 3 && ["open_vibefoundry", "setup_vibefoundry", "vf_request"].every((n) => names.includes(n)),
+    "exposes exactly the 8 tools",
+    names.length === EXPECTED_TOOLS.length && EXPECTED_TOOLS.every((n) => names.includes(n)),
     names.join(", ")
   );
   const open = (tools.result?.tools || []).find((t) => t.name === "open_vibefoundry");
   check("open_vibefoundry is linked to the widget", open?._meta?.["openai/outputTemplate"] === "ui://widget/vibefoundry.html");
+  // connect_organization is the only data tool that puts anything on screen, so
+  // it is the only one that may carry the widget — a query result rendering the
+  // IDE pane over the answer is a regression, not a feature.
+  const connect = (tools.result?.tools || []).find((t) => t.name === "connect_organization");
+  check("connect_organization is linked to the widget", connect?._meta?.["openai/outputTemplate"] === "ui://widget/vibefoundry.html");
+  check(
+    "the querying tools carry no widget",
+    ["data_catalog", "data_schema", "data_query", "data_pull"].every(
+      (n) => !(tools.result?.tools || []).find((t) => t.name === n)?._meta
+    )
+  );
+  const q = (tools.result?.tools || []).find((t) => t.name === "data_query");
+  check("data_query tells the model to profile first and never SELECT *",
+    /data_schema/.test(q?.description || "") && /SELECT \*/.test(q?.description || ""));
 
   // Dry-run + the announce call only: the real steps install software, which a
   // selftest must not. The announce call is safe by design — the first call
@@ -175,6 +288,21 @@ function check(label, ok, detail) {
   const bres = await bcall("resources/read", { uri: "ui://widget/vibefoundry.html" });
   const bhtml = bres.result?.contents?.[0]?.text || "";
   check("bare machine gets the fallback card, not an error", !bres.error && bhtml.includes("set me up to vibe code"), bres.error ? bres.error.message : `${(bhtml.length/1024).toFixed(1)} KB`);
+
+  // The data tools must exist and must answer on a machine with nothing
+  // installed — a tool that only appears once VibeFoundry is present can never
+  // be the thing that tells the user to install it. A folder nothing is serving,
+  // so discovery cannot short-circuit the install check.
+  const bareFolder = fs.mkdtempSync(path.join(os.tmpdir(), "vf-bare-"));
+  const btools = await bcall("tools/list", {});
+  const bnames = (btools.result?.tools || []).map((t) => t.name);
+  check("bare machine still advertises all 8 tools", bnames.length === EXPECTED_TOOLS.length, bnames.join(", "));
+  const bcat = await bcall("tools/call", { name: "data_catalog", arguments: { projectRoot: bareFolder } });
+  check(
+    "data_catalog on a bare machine points at setup rather than failing",
+    bcat.result?.structuredContent?.status === "not_installed",
+    bcat.result?.content?.[0]?.text
+  );
   bare.kill();
 
   console.log("\nresources/read (the pane bundle)");
@@ -230,6 +358,96 @@ function check(label, ok, detail) {
       ? `${alreadyRunning.length} running (ports ${alreadyRunning.map((i) => i.port).join("/")}) and none adopted`
       : "nothing running"
   );
+
+  // --- the data tools, against the stand-in backend ---------------------------
+  console.log("\ndata tools (stand-in backend, no gateway)");
+  const stubPort = await startStub();
+  if (!stubPort) {
+    console.log("  (ports 8765-8864 are all taken — skipped)");
+  } else {
+    // Point the fake client at the stub's folder: roots win over the model's
+    // argument, so this is how the server is made to adopt the stub and only
+    // the stub.
+    currentRoots = [STUB.folder];
+    notify("notifications/roots/list_changed");
+    await new Promise((r) => setTimeout(r, 400));
+    const dcall = (name, args) => call("tools/call", { name, arguments: { projectRoot: STUB.folder, ...args } });
+
+    const cat = await dcall("data_catalog", {});
+    const ctext = cat.result?.content?.[0]?.text || "";
+    check("data_catalog reads as a list, not as JSON", /outlet_universe/.test(ctext) && /12,345 rows/.test(ctext), ctext.split("\n")[1]);
+    check("data_catalog groups by org_id so the model can pass it back", /org_id "acme"/.test(ctext) && /org_id "public"/.test(ctext));
+    check("data_catalog carries the full list in structuredContent", (cat.result?.structuredContent?.tables || []).length === 2);
+
+    const sch = await dcall("data_schema", { org_id: "acme", table_id: "outlet_universe" });
+    const stext = sch.result?.content?.[0]?.text || "";
+    check("data_schema names the real columns and their notes", /\| state \|/.test(stext) && /Two-letter US state/.test(stext));
+    check("data_schema surfaces the refresh date to cite", /2026-08-21/.test(stext));
+
+    const qr = await dcall("data_query", { org_id: "acme", sql: "SELECT state, vol FROM outlet_universe LIMIT 2" });
+    const qtext = qr.result?.content?.[0]?.text || "";
+    const qsc = qr.result?.structuredContent || {};
+    // The relay puts the literal "ok" in text and everything in
+    // structuredContent; for a model-facing tool that is backwards, and this is
+    // the check that keeps it that way round.
+    check("data_query answers in the text, not just in structuredContent",
+      qtext.startsWith("| state | vol |") && qtext !== "ok", qtext.split("\n")[0]);
+    check("data_query cites the table it used", /outlet_universe/.test(qtext));
+    check("data_query returns rows as arrays", Array.isArray(qsc.rows?.[0]) && qsc.row_count === 2);
+
+    const big = await dcall("data_query", { org_id: "acme", sql: "SELECT state, vol FROM outlet_universe WHERE tag = 'BIG'" });
+    const btext = big.result?.content?.[0]?.text || "";
+    const bodyRows = btext.split("\n").filter((l) => l.startsWith("| S")).length;
+    check("a big result is capped at 50 rows of text and 500 structured",
+      bodyRows === 50 && big.result?.structuredContent?.rows?.length === 500 && /50 of 1,200 rows shown/.test(btext),
+      `${bodyRows} text rows, ${big.result?.structuredContent?.rows?.length} structured`);
+
+    const bad = await dcall("data_query", { org_id: "acme", sql: "SELECT BADCOL FROM outlet_universe" });
+    check("a rejected query tells the model to fix the SQL",
+      bad.result?.isError === true && /data_schema/.test(bad.result?.content?.[0]?.text || ""),
+      bad.result?.content?.[0]?.text);
+
+    const gone = await dcall("data_query", { org_id: "acme", sql: "SELECT EXPIRED FROM outlet_universe" });
+    check("an expired connection routes to connect_organization",
+      gone.result?.structuredContent?.status === "reauth_required" && /connect_organization/.test(gone.result?.content?.[0]?.text || ""),
+      gone.result?.content?.[0]?.text);
+
+    const pull = await dcall("data_pull", { org_id: "acme", table_id: "outlet_universe", sql: "SELECT state FROM outlet_universe" });
+    check("data_pull reports where the file landed",
+      /cut\.parquet/.test(pull.result?.content?.[0]?.text || "") && !!pull.result?.structuredContent?.path,
+      pull.result?.content?.[0]?.text);
+
+    const conn = await dcall("connect_organization", {});
+    check("connect_organization lists the orgs and keeps the widget on the result",
+      /org_id "acme"/.test(conn.result?.content?.[0]?.text || "") &&
+        conn.result?._meta?.["openai/outputTemplate"] === "ui://widget/vibefoundry.html");
+    const conn2 = await dcall("connect_organization", { org_id: "acme" });
+    check("connect_organization never asks the chat for a key",
+      conn2.result?.structuredContent?.status === "opened" &&
+        !/api key|app_?id|secret|\.env/i.test(conn2.result?.content?.[0]?.text || ""),
+      conn2.result?.content?.[0]?.text);
+
+    // A backend that predates /api/org/* must be told to update rather than be
+    // asked a question it will answer with a 404 page.
+    STUB.version = "0.4.23";
+    const old = await dcall("data_catalog", {});
+    check("an old backend is sent to setup_vibefoundry, not queried",
+      old.result?.structuredContent?.status === "needs_update" &&
+        /setup_vibefoundry/.test(old.result?.content?.[0]?.text || ""),
+      old.result?.content?.[0]?.text);
+    STUB.version = "0.5.0";
+
+    // Nothing the data tools did may reach the buffer the user can copy.
+    const after = await call("tools/call", { name: "vf_request", arguments: { path: "/__plugin/log" } });
+    const dump = JSON.stringify(after.result?.structuredContent?.json?.log || []);
+    check("no query, result or credential reaches the diagnostics log",
+      !/SELECT|outlet_universe|acme|p@acme/i.test(dump), `${(after.result?.structuredContent?.json?.log || []).length} events`);
+
+    STUB.server.close();
+    currentRoots = [folder];
+    notify("notifications/roots/list_changed");
+    await new Promise((r) => setTimeout(r, 400));
+  }
 
   if (doLaunch) {
     console.log(`\nopen_vibefoundry on ${folder}  (opens a terminal window)`);
