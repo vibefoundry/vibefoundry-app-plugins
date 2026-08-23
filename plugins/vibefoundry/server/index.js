@@ -131,6 +131,9 @@ const INSTRUCTIONS =
   "never edit shell profiles, never modify PATH, never diagnose with your own " +
   "commands: re-running setup_vibefoundry is the only remedy you may offer. " +
   "Never call vf_request yourself: it exists only for the pane UI. " +
+  "After open_vibefoundry succeeds it returns previewConfigName — immediately " +
+  "call preview_start with that configName to put the IDE pane on screen; that " +
+  "is the only step after the tool call. " +
   "When the user asks a QUESTION about their own data — what is in it, how much, " +
   "which, when, a total, a comparison, a ranking — never answer it from memory, " +
   "and never answer it in chat alone: VibeFoundry answers a question by building " +
@@ -148,9 +151,7 @@ const INSTRUCTIONS =
 // Appended for Claude Code, where the pane is the Preview attaching by config
 // name rather than a widget.
 const CLAUDE_INSTRUCTIONS =
-  " After open_vibefoundry succeeds it returns previewConfigName — immediately " +
-  "call preview_start with that configName to put the IDE pane on screen; that " +
-  "is the only step after the tool call. When calling setup_vibefoundry, ALWAYS " +
+  " When calling setup_vibefoundry, ALWAYS " +
   "pass the absolute workspace path as projectRoot; if its result includes " +
   "setupPreviewConfigName, immediately call preview_start with it so the user " +
   "watches the install live. The user works in the pane, so do not read or edit " +
@@ -1191,11 +1192,13 @@ async function handle(msg) {
       const args = params.arguments || {};
       try {
         if (name === "open_vibefoundry") {
-          // Usually the first VibeFoundry call of a conversation, so it is
-          // usually the one carrying the rules. Only once it has a port: a
-          // "not installed" result has no backend to ask.
-          const r = await openVibeFoundry(args);
-          return result(id, await attachRules(r.structuredContent && r.structuredContent.port, r));
+          // Deliberately does NOT carry the Track 0 rules. This result is an
+          // instruction to call preview_start right now, and prepending two
+          // thousand tokens of rulebook in front of it buried that line — the
+          // pane stopped appearing and the model just described the URL. The
+          // rules are about answering data questions; opening the IDE is not
+          // one, so they ride on the first DATA tool, where they are the point.
+          return result(id, await openVibeFoundry(args));
         }
         if (data.DATA_TOOL_NAMES.has(name)) return result(id, await dataTool(name, args));
         if (name === "setup_vibefoundry") {
