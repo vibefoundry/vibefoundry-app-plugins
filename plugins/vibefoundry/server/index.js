@@ -805,7 +805,12 @@ async function connectOrganization(args, projectRoot, port) {
   if (!orgId) {
     const r = await orgFetch(port, "/api/org/list");
     if (r.fail) return r.fail;
-    const orgs = Array.isArray(r.json) ? r.json : r.json.orgs || [];
+    // /api/org/list answers {"organizations": [...], "public": {...}}. This read
+    // `orgs`, a key the backend has never sent, so connect_organization always
+    // saw an empty list and told the user no organization was bundled — instead
+    // of opening the sign-in. Third time a guessed key has broken this surface:
+    // read the one documented shape.
+    const orgs = r.json && Array.isArray(r.json.organizations) ? r.json.organizations : [];
     const lines = orgs.map((o) => {
       const id = o.org_id || o.id;
       const where = o.connected ? ` — already connected${o.email ? ` as ${o.email}` : ""}` : "";

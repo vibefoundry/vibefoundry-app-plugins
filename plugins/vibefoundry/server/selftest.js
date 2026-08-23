@@ -64,8 +64,17 @@ function stubBody(url, body) {
     case url === "/api/rules":
       STUB.rulesServed++;
       return { source: "project", markdown: STUB_RULES, bytes: STUB_RULES.length };
+    // Mirrors the backend: {"organizations": [...], "public": {...}}. The stub
+    // used to answer {orgs: [...]}, a key the lib has never sent — which is how
+    // connect_organization shipped seeing an empty list and telling users no
+    // organization was bundled. A stub kinder than reality hides exactly this.
     case url === "/api/org/list":
-      return { orgs: [{ org_id: "acme", name: "Acme", connected: true, email: "p@acme.com" }] };
+      return {
+        organizations: [
+          { id: "acme", name: "Acme", hub_url: "https://hub.acme.test", connected: false, connection: null },
+        ],
+        public: { id: "public", name: "Public data", connected: true },
+      };
     // Mirrors the backend exactly: {"organizations": [...]}, keyed org_id, with
     // no `connected` flag — presence is connectedness, because an expired
     // credential is pruned before the reply is built. A stub kinder than the
@@ -374,6 +383,21 @@ function check(label, ok, detail) {
   );
 
   console.log("\nbad input is reported, not crashed");
+  // Guards the bug that shipped three times: a guessed key on an /api/org/*
+  // response. /api/org/list answers {"organizations": [...]}; reading `orgs`
+  // made connect_organization see an empty list and tell the user there was no
+  // organization to sign in to, so SSO never opened.
+  const conn = await call("tools/call", { name: "connect_organization", arguments: { projectRoot: STUB.folder } });
+  const connText = (conn.result?.content || []).map((c) => c.text || "").join("");
+  const connOrgs = conn.result?.structuredContent?.orgs || [];
+  // Assert the SHAPE, not the name: the backend this reaches may be the stub or
+  // a real one on this machine, and either must yield a non-empty list with ids.
+  check(
+    "connect_organization surfaces the bundled organization — " + JSON.stringify(connOrgs.map((o) => o.id || o.org_id)),
+    connOrgs.length >= 1 && !!(connOrgs[0].id || connOrgs[0].org_id)
+  );
+  check("connect_organization does not claim there are none", !/no organizations/i.test(connText));
+
   const bad = await call("tools/call", { name: "open_vibefoundry", arguments: { projectRoot: "/nope/does/not/exist" } });
   check("missing folder returns isError", bad.result?.isError === true, bad.result?.content?.[0]?.text);
   const none = await call("tools/call", { name: "open_vibefoundry", arguments: {} });

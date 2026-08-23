@@ -147,7 +147,11 @@ const CATALOG_TOOL = {
     "you would otherwise answer from memory or by guessing a table name. Never " +
     "invent a table name: this catalogue is the only source of truth for what " +
     "exists, and the org_id and table id it returns are exactly what data_schema, " +
-    "data_query and data_pull take.",
+    "data_query and data_pull take. If it reports that no organization is " +
+    "connected, the user's OWN data is not in this session — ask them \"Do you want " +
+    "to use your organization's private data?\", wait for the answer, and call " +
+    "connect_organization if they say yes. Never answer a question about their data " +
+    "from public datasets without offering that first.",
   inputSchema: {
     type: "object",
     properties: { projectRoot: PROJECT_ROOT_PROPERTY },
@@ -373,9 +377,10 @@ function catalogResult(json) {
   if (!items.length) {
     return say(
       "No tables are available yet — no organization is connected and no public " +
-        "dataset came back. Call connect_organization to sign the user in, then call " +
-        "data_catalog again.",
-      { status: "empty", tables: [] }
+        "dataset came back. Ask the user, in these words: \"Do you want to use your " +
+        "organization's private data?\" If they say yes, call connect_organization to " +
+        "sign them in, then call data_catalog again.",
+      { status: "empty", ask_user_to_connect: true, tables: [] }
     );
   }
 
@@ -400,18 +405,42 @@ function catalogResult(json) {
     }
   }
 
+  // Public datasets are always reachable, so a catalogue is never empty — which
+  // meant a question got answered from public data and the user was never told
+  // their own data existed and was one sign-in away. If nothing here comes from
+  // an organization, the offer leads and the table list follows.
+  const hasOrgData = items.some((t) => String(t.source || "org") !== "public");
+  const offer =
+    "NO ORGANIZATION IS CONNECTED, so none of this user's own data is reachable in " +
+    "this session — only the public datasets listed below.\n\n" +
+    "Before you answer anything from public data, ASK THE USER, in these words:\n" +
+    '  "Do you want to use your organization\'s private data?"\n\n' +
+    "Then stop and wait. If they say yes, call connect_organization — it opens their " +
+    "own organization's sign-in page in a browser, and once they finish, call " +
+    "data_catalog again and their tables will be here. Only if they say no should you " +
+    "answer from the public datasets. Do not quietly substitute public data for the " +
+    "data they asked about, and do not tell them their data is unavailable — it is " +
+    "one sign-in away.\n\n";
+
   return {
     content: [
       {
         type: "text",
         text:
+          (hasOrgData ? "" : offer) +
           lines.join("\n") +
           "\n\nPick the table that answers the question, call data_schema on it to get " +
           "its real column names, then call data_query with the narrowest SQL that " +
           "answers it.",
       },
     ],
-    structuredContent: { status: "ok", table_count: items.length, tables: fitRows(items) },
+    structuredContent: {
+      status: "ok",
+      organization_connected: hasOrgData,
+      ask_user_to_connect: !hasOrgData,
+      table_count: items.length,
+      tables: fitRows(items),
+    },
   };
 }
 
