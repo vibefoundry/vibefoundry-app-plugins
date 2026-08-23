@@ -383,21 +383,6 @@ function check(label, ok, detail) {
   );
 
   console.log("\nbad input is reported, not crashed");
-  // Guards the bug that shipped three times: a guessed key on an /api/org/*
-  // response. /api/org/list answers {"organizations": [...]}; reading `orgs`
-  // made connect_organization see an empty list and tell the user there was no
-  // organization to sign in to, so SSO never opened.
-  const conn = await call("tools/call", { name: "connect_organization", arguments: { projectRoot: STUB.folder } });
-  const connText = (conn.result?.content || []).map((c) => c.text || "").join("");
-  const connOrgs = conn.result?.structuredContent?.orgs || [];
-  // Assert the SHAPE, not the name: the backend this reaches may be the stub or
-  // a real one on this machine, and either must yield a non-empty list with ids.
-  check(
-    "connect_organization surfaces the bundled organization — " + JSON.stringify(connOrgs.map((o) => o.id || o.org_id)),
-    connOrgs.length >= 1 && !!(connOrgs[0].id || connOrgs[0].org_id)
-  );
-  check("connect_organization does not claim there are none", !/no organizations/i.test(connText));
-
   const bad = await call("tools/call", { name: "open_vibefoundry", arguments: { projectRoot: "/nope/does/not/exist" } });
   check("missing folder returns isError", bad.result?.isError === true, bad.result?.content?.[0]?.text);
   const none = await call("tools/call", { name: "open_vibefoundry", arguments: {} });
@@ -518,6 +503,11 @@ function check(label, ok, detail) {
       STUB.rulesServed === 2, `${STUB.rulesServed} fetch(es)`);
 
     const conn = await dcall("connect_organization", {});
+    // This is the check that should have caught the shipped bug: connect_organization
+    // read `orgs` off /api/org/list, which answers `organizations`, so it always saw
+    // an empty list and told users there was nothing to sign in to. It passed anyway
+    // because the stub above returned the same invented key. The stub is honest now,
+    // so this assertion has teeth.
     check("connect_organization lists the orgs and keeps the widget on the result",
       /org_id "acme"/.test(conn.result?.content?.[0]?.text || "") &&
         conn.result?._meta?.["openai/outputTemplate"] === "ui://widget/vibefoundry.html");
