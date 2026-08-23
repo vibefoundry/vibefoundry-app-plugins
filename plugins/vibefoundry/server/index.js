@@ -765,20 +765,6 @@ async function orgFetchOnce(port, path, method, body, hint) {
   // the call again — the model is not told about any of it.
   if (json && json.status === "reauth_started") return { reauth: String(json.org_id || "") };
 
-  // The org's credential lapsed. Not an error — an instruction: the whole point
-  // of the personal credential expiring is that reconnecting is one tool call.
-  if (json && json.status === "reauth_required") {
-    const org = json.org_id || "";
-    return {
-      fail: textResult(
-        `The connection to ${org || "that organization"} has expired. Call connect_organization` +
-          (org ? ` with org_id "${org}"` : "") +
-          " to sign the user in again, then run this again.",
-        { status: "reauth_required", org_id: org || null }
-      ),
-    };
-  }
-
   if (res.status >= 400 || !json) {
     const detail = (json && (json.detail || json.error || json.message)) || text.slice(0, 500) || `HTTP ${res.status}`;
     return {
@@ -900,16 +886,19 @@ async function relayDataTool(name, args, projectRoot, port) {
   if (name === "data_query") {
     const orgId = required(args, "org_id", "data_query");
     const sql = required(args, "sql", "data_query");
-    const body = { org_id: orgId, sql };
-    if (Number.isFinite(args && args.limit)) body.limit = args.limit;
+    const scriptName = required(args, "script_name", "data_query");
+    // /api/org/answer, not /api/org/query: answering builds and runs the script
+    // and hands back what landed in final_output/. /api/org/query is the plain
+    // fetch the generated step calls, and pointing here at it made the tool
+    // return rows while building nothing.
     const r = await orgFetch(
       port,
-      "/api/org/query",
+      "/api/org/answer",
       "POST",
-      body,
-      " — the query was rejected. Confirm the column names with data_schema, fix the SQL, and call data_query again."
+      { org_id: orgId, sql, script_name: scriptName },
+      " — confirm the column names with data_schema, fix the SQL, and call data_query again."
     );
-    return r.fail || data.queryResult(r.json, { org_id: orgId, sql });
+    return r.fail || data.answerResult(r.json, { org_id: orgId, sql, script_name: scriptName });
   }
 
   const orgId = required(args, "org_id", "data_pull");

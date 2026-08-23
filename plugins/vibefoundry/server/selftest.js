@@ -40,7 +40,7 @@ const EXPECTED_TOOLS = [
 // adoption, the version gate, the relay and the shaping of the result — and
 // stops exactly where the plugin's responsibility does.
 const STUB = {
-  version: "0.6.0",
+  version: "0.8.0",
   folder: fs.mkdtempSync(path.join(os.tmpdir(), "vf-stub-")),
   server: null,
   port: null,
@@ -127,6 +127,27 @@ function stubBody(url, body) {
       const rows = [];
       for (let i = 0; i < n; i++) rows.push([`S${i}`, i * 1.5]);
       return { columns: ["state", "vol"], rows, row_count: n, truncated: false, tables_used: ["outlet_universe"], elapsed_ms: 41 };
+    }
+    // /api/org/answer builds and runs the script and hands back what landed in
+    // final_output/. /api/org/query stays the plain fetch the generated step
+    // calls — pointing the tool at that one made it return rows and build
+    // nothing, and recursed until the script timed out.
+    case url === "/api/org/answer" && /BADCOL/.test(sql):
+      return { __status: 400, detail: "ColumnNotFound: nope" };
+    case url === "/api/org/answer": {
+      const n = /BIG/.test(sql) ? 1200 : 2;
+      const rows = [];
+      for (let i = 0; i < n; i++) rows.push([`S${i}`, i * 1.5]);
+      return {
+        status: "ok",
+        script_name: (body && body.script_name) || "t",
+        folder: path.join(STUB.folder, "app_folder", "scripts", (body && body.script_name) || "t"),
+        files: [path.join(STUB.folder, "final_output", "answer.parquet")],
+        columns: ["state", "vol"],
+        rows,
+        row_count: n,
+        truncated: false,
+      };
     }
     case url === "/api/org/pull":
       return { status: "ok", path: path.join(STUB.folder, "input_folder", "cut.parquet"), row_count: 2 };
@@ -445,7 +466,7 @@ function check(label, ok, detail) {
     check("data_schema names the real columns and their notes", /\| state \|/.test(stext) && /Two-letter US state/.test(stext));
     check("data_schema surfaces the refresh date to cite", /2026-08-21/.test(stext));
 
-    const qr = await dcall("data_query", { org_id: "acme", sql: "SELECT state, vol FROM outlet_universe LIMIT 2" });
+    const qr = await dcall("data_query", { org_id: "acme", script_name: "t", sql: "SELECT state, vol FROM outlet_universe LIMIT 2" });
     const qtext = qr.result?.content?.[0]?.text || "";
     const qsc = qr.result?.structuredContent || {};
     // The relay puts the literal "ok" in text and everything in
@@ -453,33 +474,29 @@ function check(label, ok, detail) {
     // the check that keeps it that way round.
     check("data_query answers in the text, not just in structuredContent",
       qtext.startsWith("| state | vol |") && qtext !== "ok", qtext.split("\n")[0]);
-    check("data_query cites the table it used", /outlet_universe/.test(qtext));
+    check("data_query says where it built the script", /scripts/.test(qtext));
     check("data_query returns rows as arrays", Array.isArray(qsc.rows?.[0]) && qsc.row_count === 2);
 
-    const big = await dcall("data_query", { org_id: "acme", sql: "SELECT state, vol FROM outlet_universe WHERE tag = 'BIG'" });
+    const big = await dcall("data_query", { org_id: "acme", script_name: "t", sql: "SELECT state, vol FROM outlet_universe WHERE tag = 'BIG'" });
     const btext = big.result?.content?.[0]?.text || "";
     const bodyRows = btext.split("\n").filter((l) => l.startsWith("| S")).length;
     check("a big result is capped at 50 rows of text and 500 structured",
       bodyRows === 50 && big.result?.structuredContent?.rows?.length === 500 && /50 of 1,200 rows shown/.test(btext),
       `${bodyRows} text rows, ${big.result?.structuredContent?.rows?.length} structured`);
 
-    const bad = await dcall("data_query", { org_id: "acme", sql: "SELECT BADCOL FROM outlet_universe" });
+    const bad = await dcall("data_query", { org_id: "acme", script_name: "t", sql: "SELECT BADCOL FROM outlet_universe" });
     check("a rejected query tells the model to fix the SQL",
       bad.result?.isError === true && /data_schema/.test(bad.result?.content?.[0]?.text || ""),
       bad.result?.content?.[0]?.text);
 
-    const gone = await dcall("data_query", { org_id: "acme", sql: "SELECT EXPIRED FROM outlet_universe" });
-    check("an expired connection routes to connect_organization",
-      gone.result?.structuredContent?.status === "reauth_required" && /connect_organization/.test(gone.result?.content?.[0]?.text || ""),
-      gone.result?.content?.[0]?.text);
-
-    // An expired credential the backend is already re-opening the browser for.
-    // The plugin waits it out and runs the query again, so the model sees the
-    // answer rather than an errand.
-    const rauth = await dcall("data_query", { org_id: "acme", sql: "SELECT REAUTH FROM outlet_universe" });
-    check("an expired credential re-authenticates and the query is retried once",
-      rauth.result?.structuredContent?.status === "ok" && rauth.result?.structuredContent?.row_count === 2,
-      rauth.result?.content?.[0]?.text?.split("\n").pop());
+    // No expired-connection errand to test any more: the backend signs the user
+    // in inside the call and returns rows. Handing back "reauth_required" is
+    // what produced "I can't sign in for you" — the branch is deleted, so the
+    // check that it routes somewhere is deleted with it.
+    const missing = await dcall("data_query", { org_id: "acme", sql: "SELECT state FROM outlet_universe" });
+    check("data_query refuses without a script_name rather than guessing a folder",
+      missing.result?.isError === true && /script_name/.test(missing.result?.content?.[0]?.text || ""),
+      missing.result?.content?.[0]?.text);
 
     const pull = await dcall("data_pull", { org_id: "acme", table_id: "outlet_universe", sql: "SELECT state FROM outlet_universe" });
     check("data_pull reports where the file landed",

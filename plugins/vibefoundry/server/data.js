@@ -17,7 +17,7 @@
 // Older ones answer 404, or worse answer something else on the same path, so
 // this is checked against /api/health BEFORE any org call rather than after one
 // fails.
-const MIN_BACKEND_VERSION = "0.6.0";
+const MIN_BACKEND_VERSION = "0.8.0";
 
 const UPGRADE_TEXT =
   "VibeFoundry needs an update before it can answer questions about data — tell " +
@@ -108,17 +108,10 @@ const CONNECT_TOOL = {
   name: "connect_organization",
   title: "Connect Organization",
   description:
-    "Connect this machine to the user's organization so their tables become " +
-    "queryable. Call it whenever the user asks to connect to, sign in to or link " +
-    "their organization, their company data, their data hub or their portal — and " +
-    "whenever data_catalog, data_schema, data_query or data_pull report that " +
-    "nothing is connected. It opens the Organizations panel in the VibeFoundry " +
-    "pane and sends the user to their own organization's sign-in page in a " +
-    "browser; they approve there and the connection completes itself. NEVER ask " +
-    "the user for an API key, an app id, a secret or a .env file, and never write " +
-    "one: this tool is the only way credentials are obtained, they are stored by " +
-    "VibeFoundry on the user's machine, and neither you nor this plugin ever sees " +
-    "them.",
+    "Sign the user in to their organization. Opens their organization's own " +
+    "sign-in page in a browser and completes when they approve. The data tools " +
+    "do this by themselves when they need to, so call it only when the user asks " +
+    "to connect, switch or re-connect an organization.",
   inputSchema: {
     type: "object",
     properties: {
@@ -140,18 +133,10 @@ const CATALOG_TOOL = {
   name: "data_catalog",
   title: "List Available Data",
   description:
-    "List every table the user can actually query: their connected " +
-    "organization's tables plus the public datasets. Call this FIRST — before " +
-    "answering anything about the user's data — whenever they ask what data they " +
-    "have, what tables exist, whether some subject is covered, or ask a question " +
-    "you would otherwise answer from memory or by guessing a table name. Never " +
-    "invent a table name: this catalogue is the only source of truth for what " +
-    "exists, and the org_id and table id it returns are exactly what data_schema, " +
-    "data_query and data_pull take. If it reports that no organization is " +
-    "connected, the user's OWN data is not in this session — ask them \"Do you want " +
-    "to use your organization's private data?\", wait for the answer, and call " +
-    "connect_organization if they say yes. Never answer a question about their data " +
-    "from public datasets without offering that first.",
+    "Every table the user can query — their organization's plus the public " +
+    "datasets. Call this before answering anything about their data: it is the " +
+    "only source of truth for what exists, and no table name is guessable. The " +
+    "org_id and table id it returns are what the other tools take.",
   inputSchema: {
     type: "object",
     properties: { projectRoot: PROJECT_ROOT_PROPERTY },
@@ -164,13 +149,10 @@ const SCHEMA_TOOL = {
   name: "data_schema",
   title: "Profile A Table",
   description:
-    "Profile one table before you write SQL against it: its exact column names " +
-    "and types, null counts, sample values for categorical columns, ranges for " +
-    "numeric ones, and when it was last refreshed. Call this after data_catalog " +
-    "and before EVERY data_query — column names are not guessable, and a query " +
-    "written from a guessed name simply fails. Read the per-column notes: they " +
-    "say what a column actually means, which is usually not what its name " +
-    "suggests.",
+    "One table's real column names, types, ranges and sample values, and when it " +
+    "was last refreshed. Call it before writing SQL against a table — column names " +
+    "are not guessable. Read the per-column notes: they say what a column means, " +
+    "which is usually not what its name suggests.",
   inputSchema: {
     type: "object",
     properties: {
@@ -190,17 +172,13 @@ const QUERY_TOOL = {
   name: "data_query",
   title: "Query Data",
   description:
-    "Run one read-only SQL SELECT where the data lives and get the rows back. Use " +
-    "it to CHECK something while you build — that a filter matches, that a column " +
-    "holds what data_schema implied, that a number looks sane. It is not how a " +
-    "question gets answered: VibeFoundry answers by building a small script, so " +
-    "the rows a question needs come down through data_pull into raw_pulls/, and " +
-    "the answer you report is what the script wrote into final_output/. Call " +
-    "data_schema on every table you reference first, then write the NARROWEST " +
-    "query: name only the columns you need, filter and aggregate in SQL, add an " +
-    "ORDER BY and a LIMIT. Never write SELECT * — a whole table is not an answer, " +
-    "and pulling one is slow and wasteful. One statement only: no comments, no " +
-    "semicolon-separated statements, no writes or DDL of any kind.",
+    "Answer a question about the user's data. Give it SQL and a script_name; it " +
+    "signs the user in if needed, builds app_folder/scripts/<script_name>/, writes " +
+    "the SQL into steps/step1_pull.py, runs it, and returns what the script wrote " +
+    "into final_output/. Report those rows — they are the answer. Call data_schema " +
+    "first so the column names are real. Write the narrowest query that answers " +
+    "the question; SELECT *, multiple statements and non-SELECT are refused. " +
+    "A follow-up on the same subject reuses the same script_name.",
   inputSchema: {
     type: "object",
     properties: {
@@ -208,6 +186,13 @@ const QUERY_TOOL = {
       org_id: {
         type: "string",
         description: 'The org_id from data_catalog. Public datasets use "public".',
+      },
+      script_name: {
+        type: "string",
+        description:
+          "Short name for the script this question builds, in lower_snake_case, " +
+          "from the question itself — georgia_top_accounts. A follow-up on the " +
+          "same subject reuses the same name and edits that script.",
       },
       sql: {
         type: "string",
@@ -223,7 +208,7 @@ const QUERY_TOOL = {
           "LIMIT inside the SQL.",
       },
     },
-    required: ["projectRoot", "org_id", "sql"],
+    required: ["projectRoot", "org_id", "sql", "script_name"],
   },
   annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: true, readOnlyHint: true },
 };
@@ -232,20 +217,9 @@ const PULL_TOOL = {
   name: "data_pull",
   title: "Pull Data Into The Project",
   description:
-    "Land the rows a question needs on disk, and create the script folder to hold " +
-    "them. This is the normal way to answer a question: VibeFoundry answers by " +
-    "building a small script, and this call is what starts it. Pass `script_name` " +
-    "(the name you chose) and the cut lands in " +
-    "app_folder/scripts/<script_name>/raw_pulls/ — the call creates that folder " +
-    "with raw_pulls/, steps/ and final_output/, writes vf.py at its root and a " +
-    "steps/step1_pull.py stub. Never make the folder by hand: without vf.py the " +
-    "steps cannot run. Omit `script_name` and the cut goes to input_folder/ for a " +
-    "Track 1–4 app. " +
-    "ALWAYS pass a `sql` SELECT so only the rows and columns the question needs " +
-    "cross the wire — call data_schema first and name the columns, filter and " +
-    "aggregate in SQL. Omit `sql` only when the whole table genuinely is the " +
-    "input. A whole-table pull to answer one question is the thing this tool " +
-    "exists to avoid.",
+    "Land rows on disk for a Track 1-4 app to read, without running anything. " +
+    "To answer a question use data_query instead — this writes a file and returns " +
+    "no answer. Pass a `sql` SELECT so only the needed rows cross the wire.",
   inputSchema: {
     type: "object",
     properties: {
@@ -502,6 +476,38 @@ function schemaResult(json, orgId, tableId) {
   };
 }
 
+function answerResult(json, meta) {
+  // What the script wrote into final_output/, not rows glimpsed on the way
+  // past — so the file and the answer cannot disagree.
+  const columns = Array.isArray(json && json.columns) ? json.columns : [];
+  const rows = Array.isArray(json && json.rows) ? json.rows : [];
+  const total = Number.isFinite(json && json.row_count) ? json.row_count : rows.length;
+  const shown = rows.slice(0, TEXT_ROWS);
+  const lines = [markdownTable(columns, shown)];
+  lines.push(
+    total > shown.length
+      ? `\n${shown.length} of ${num(total)} rows shown.`
+      : `\n${num(total)} row${total === 1 ? "" : "s"}.`
+  );
+  if (json && json.folder) {
+    lines.push(`Built ${json.folder} — the SQL is in steps/step1_pull.py, so re-running app.py re-answers this against today's data.`);
+  }
+  for (const f of (json && json.files) || []) lines.push(`Wrote ${f}`);
+  return {
+    content: [{ type: "text", text: lines.join("\n") }],
+    structuredContent: {
+      status: "ok",
+      script_name: meta.script_name,
+      folder: json && json.folder,
+      files: (json && json.files) || [],
+      columns,
+      rows: fitRows(rows),
+      row_count: total,
+    },
+  };
+}
+
+
 function queryResult(json, meta) {
   // A large result spills to a parquet file and comes back as a preview; a
   // small one is the whole thing. Both shapes render the same way.
@@ -601,6 +607,7 @@ function rulesResult(json) {
 }
 
 module.exports = {
+  answerResult,
   MIN_BACKEND_VERSION,
   UPGRADE_TEXT,
   DATA_TOOL_NAMES,
