@@ -720,7 +720,8 @@ async function backendJson(path, method = "GET", body) {
     init.headers["content-type"] = "application/json";
     init.body = JSON.stringify(body);
   }
-  const response = await fetch(`http://127.0.0.1:${BACKEND}${path}`, init);
+  // BACKEND is already a full origin ("http://127.0.0.1:<port>"), not a port.
+  const response = await fetch(`${BACKEND}${path}`, init);
   const text = await response.text();
   let json = null;
   try {
