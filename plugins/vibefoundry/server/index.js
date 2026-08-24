@@ -826,9 +826,41 @@ async function vfConnect(args) {
   return say(portalRemedy(state) || "Not connected to a portal yet.", state);
 }
 
+// When a blocked call last opened the sign-in page, so a model retrying in a
+// loop opens one tab, not one per retry.
+let lastSignInOpened = 0;
+
 async function portalGuard() {
   const state = await portalStatus();
   if (state.ready) return null;
+
+  // A lapsed sign-in has exactly one remedy and it needs no decision from
+  // anyone, so take it here rather than asking the model to please call
+  // vf_connect - an instruction one host followed and another ignored. The
+  // browser opens, the person signs in, the next ask succeeds.
+  if (state.needs === "portal_signin") {
+    const org = state.org || {};
+    const throttled = Date.now() - lastSignInOpened < 90 * 1000;
+    if (!throttled) {
+      const started = await backendJson("/api/portal/signin/start", "POST");
+      if (started.status === 200 && started.json && started.json.url) {
+        lastSignInOpened = Date.now();
+        openInBrowser(started.json.url);
+        return say(
+          `Your ${org.name || "portal"} sign-in has lapsed - I've opened the ` +
+            "sign-in page in your browser. Sign in there (it takes a few " +
+            "seconds), then ask your question again.",
+          { ...state, blocked: true, signInOpened: true, signInUrl: started.json.url }
+        );
+      }
+    }
+    return say(
+      `Sign in to the ${org.name || "portal"} portal in the browser tab that ` +
+        "just opened, then ask again.",
+      { ...state, blocked: true }
+    );
+  }
+
   const remedy = portalRemedy(state);
   return say(
     remedy + " (Call vf_connect to do this.)",
