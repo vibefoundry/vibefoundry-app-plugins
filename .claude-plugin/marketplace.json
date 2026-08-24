@@ -7,7 +7,7 @@
   },
   "metadata": {
     "description": "VibeFoundry \u2014 the data-science IDE, set up and launched as an in-app pane.",
-    "version": "0.12.1"
+    "version": "0.13.0"
   },
   "plugins": [
     {

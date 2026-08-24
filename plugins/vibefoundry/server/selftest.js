@@ -113,13 +113,45 @@ function check(label, ok, detail) {
   console.log("\ntools/list");
   const tools = await call("tools/list", {});
   const names = (tools.result?.tools || []).map((t) => t.name);
+  const EXPECTED = [
+    "open_vibefoundry",
+    "setup_vibefoundry",
+    "vf_connect",
+    "vf_tables",
+    "vf_query",
+    "vf_request",
+  ];
   check(
-    "exposes exactly open_vibefoundry + setup_vibefoundry + vf_request",
-    names.length === 3 && ["open_vibefoundry", "setup_vibefoundry", "vf_request"].every((n) => names.includes(n)),
+    "exposes exactly the six tools",
+    names.length === EXPECTED.length && EXPECTED.every((n) => names.includes(n)),
     names.join(", ")
   );
   const open = (tools.result?.tools || []).find((t) => t.name === "open_vibefoundry");
   check("open_vibefoundry is linked to the widget", open?._meta?.["openai/outputTemplate"] === "ui://widget/vibefoundry.html");
+
+  // The portal tools are read-only relays, and the schema is what a host shows
+  // the model. A required `sql` is the one field whose absence would let a
+  // query be attempted with nothing to run.
+  const query = (tools.result?.tools || []).find((t) => t.name === "vf_query");
+  check("vf_query requires sql", (query?.inputSchema?.required || []).includes("sql"));
+  check("vf_query is marked read-only", query?.annotations?.readOnlyHint === true);
+  const tablesTool = (tools.result?.tools || []).find((t) => t.name === "vf_tables");
+  check("vf_tables is marked read-only", tablesTool?.annotations?.readOnlyHint === true);
+
+  // Without a backend these must refuse in a way that names the remedy, not
+  // throw something a model will relay as a mystery.
+  console.log("\nportal tools with no backend running");
+  for (const name of ["vf_connect", "vf_tables", "vf_query"]) {
+    const args = name === "vf_query" ? { sql: "SELECT 1" } : {};
+    const r = await call("tools/call", { name, arguments: args });
+    const text =
+      r.result?.content?.[0]?.text || r.result?.structuredContent?.error || r.error?.message || "";
+    check(
+      `${name} says VibeFoundry is not running`,
+      /not running|open_vibefoundry/i.test(String(text)),
+      String(text).slice(0, 90)
+    );
+  }
 
   // Dry-run + the announce call only: the real steps install software, which a
   // selftest must not. The announce call is safe by design — the first call

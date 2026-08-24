@@ -18,6 +18,7 @@
  */
 
 const fs = require("fs");
+const { spawn } = require("child_process");
 const { discover, stop } = require("./instances");
 const { launch, paneHtmlPath, isInstalled, sameFolder } = require("./launch");
 const { setupCall, getProgressState } = require("./setup");
@@ -396,6 +397,98 @@ const SETUP_TOOL = {
   _meta: SETUP_TOOL_META,
 };
 
+const PORTAL_TOOLS_NOTE =
+  "Data stays in the client's portal. These tools send the question and bring " +
+  "back the answer — rows, not tables. Nothing is downloaded and nothing is " +
+  "written to the project.";
+
+const CONNECT_TOOL = {
+  name: "vf_connect",
+  title: "Connect to a Client Portal",
+  description:
+    "Connect this project to a client's data portal, and sign in to it. Call " +
+    "this when vf_tables or vf_query reports that the project is not " +
+    "connected or that the sign-in has lapsed — its result says which of " +
+    "those it is and what to do. Called with no arguments it reports the " +
+    "current state: which organizations this VibeFoundry account may reach, " +
+    "which one this project is bound to, and whether a portal sign-in is " +
+    "live. Pass `hub` to bind the project to one of the listed organizations. " +
+    "Portal sign-ins last an hour by design, so being asked to sign in again " +
+    "is routine rather than a fault.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      hub: {
+        type: "string",
+        description:
+          "The portal address to bind this project to, copied exactly from " +
+          "the `orgs` list a previous call returned. Omit to just report state.",
+      },
+    },
+  },
+  annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: true, readOnlyHint: false },
+};
+
+const TABLES_TOOL = {
+  name: "vf_tables",
+  title: "List Portal Tables",
+  description:
+    "What the connected portal holds: every table this person may read, its " +
+    "columns, and — with `table` — that table's full profile including " +
+    "dtypes, null counts, distinct counts, sample values and numeric ranges. " +
+    "ALWAYS call this before writing SQL for vf_query. It is cheap, returns " +
+    "no data, and is the only way to know what the columns are actually " +
+    "called; SQL written without it tends to invent columns and states that " +
+    "do not exist. " + PORTAL_TOOLS_NOTE,
+  inputSchema: {
+    type: "object",
+    properties: {
+      table: {
+        type: "string",
+        description:
+          "A table id from a previous call, to get its full column profile " +
+          "rather than the catalogue.",
+      },
+    },
+  },
+  annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: true, readOnlyHint: true },
+};
+
+const QUERY_TOOL = {
+  name: "vf_query",
+  title: "Query the Portal",
+  description:
+    "Answer a question by running one read-only SQL statement inside the " +
+    "client's portal. Use it whenever the user asks something about the " +
+    "portal's data — totals, rankings, comparisons, counts. Prefer it over " +
+    "downloading a table: the query runs where the data lives and only the " +
+    "result travels. " +
+    "The dialect is DuckDB, so ordinary PostgreSQL-shaped SQL works, " +
+    "including CTEs and window functions. One statement, SELECT or WITH, no " +
+    "comments. Aggregate and filter in the SQL rather than selecting " +
+    "everything and reasoning over the rows. Call vf_tables first so the " +
+    "column names are real. " + PORTAL_TOOLS_NOTE,
+  inputSchema: {
+    type: "object",
+    properties: {
+      sql: {
+        type: "string",
+        description:
+          "One SELECT or WITH statement against the tables vf_tables listed. " +
+          "No semicolons, no comments.",
+      },
+      limit: {
+        type: "integer",
+        description:
+          "Cap the rows returned. The portal caps it regardless; this only " +
+          "lowers that. Use a small number when sampling.",
+      },
+    },
+    required: ["sql"],
+  },
+  annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: true, readOnlyHint: true },
+};
+
 const PROXY_TOOL = {
   name: "vf_request",
   title: "VibeFoundry Backend Request",
@@ -578,6 +671,225 @@ async function paneHandoff(projectRoot, port) {
 
 function textResult(text, structured) {
   return { content: [{ type: "text", text }], structuredContent: structured || {} };
+}
+
+// --- the client portal --------------------------------------------------------
+//
+// These are relays, not clients. Every decision — which portal, whether the
+// sign-in is live, what the gateway refuses — belongs to the IDE and the
+// gateway, both of which enforce in code. This side only carries the question
+// there and the answer back, and turns a refusal into a sentence saying which
+// of the two sign-ins is outstanding. No credential is ever held here.
+
+/**
+ * Open a URL in the user's own browser.
+ *
+ * Their browser, deliberately: the portal sign-in has to land in the session
+ * where they are already signed in to Google, and a fresh headless context
+ * would only show them a login wall. Detached and unwatched — whether the
+ * browser opened is not something this process can usefully wait on.
+ */
+function openInBrowser(url) {
+  const platform = process.platform;
+  const [command, args] =
+    platform === "darwin"
+      ? ["open", [url]]
+      : platform === "win32"
+        ? [process.env.ComSpec || "cmd.exe", ["/c", "start", "", url]]
+        : ["xdg-open", [url]];
+  try {
+    const child = spawn(command, args, { detached: true, stdio: "ignore" });
+    child.unref();
+    return true;
+  } catch {
+    // The URL is returned to the caller regardless, so a failure here costs
+    // the user a click, not the sign-in.
+    return false;
+  }
+}
+
+async function backendJson(path, method = "GET", body) {
+  if (!BACKEND) await adoptBackend();
+  if (!BACKEND) {
+    throw new Error(
+      "VibeFoundry is not running — call open_vibefoundry first, then try again."
+    );
+  }
+  const init = { method, headers: {} };
+  if (body !== undefined) {
+    init.headers["content-type"] = "application/json";
+    init.body = JSON.stringify(body);
+  }
+  const response = await fetch(`http://127.0.0.1:${BACKEND}${path}`, init);
+  const text = await response.text();
+  let json = null;
+  try {
+    json = text ? JSON.parse(text) : null;
+  } catch {
+    json = null;
+  }
+  return { status: response.status, json, text };
+}
+
+function say(text, data) {
+  return { content: [{ type: "text", text }], structuredContent: data || {} };
+}
+
+// The remedy for each outstanding step, phrased for the person. Kept here as
+// data rather than prose in a description so the model has nothing to
+// paraphrase — it relays a sentence the relay produced.
+function portalRemedy(status) {
+  const needs = (status && status.needs) || "";
+  if (needs === "open_project") {
+    return "No project is open in VibeFoundry. Open the folder first.";
+  }
+  if (needs === "vibefoundry_signin") {
+    return "You are not signed in to VibeFoundry. Sign in, then ask again.";
+  }
+  if (needs === "pick_org") {
+    const orgs = (status && status.orgs) || [];
+    if (!orgs.length) {
+      return "Your VibeFoundry account has no client portals yet.";
+    }
+    const names = orgs.map((o) => `${o.name} (${o.hub})`).join(", ");
+    return (
+      `This project is not connected to an organization. You can reach: ${names}. ` +
+      "Say which one, and I will connect this project to it."
+    );
+  }
+  if (needs === "portal_signin") {
+    const org = (status && status.org) || {};
+    return `Sign in to the ${org.name || "client"} portal to continue.`;
+  }
+  return "";
+}
+
+async function portalStatus() {
+  const r = await backendJson("/api/portal/status");
+  if (r.status !== 200 || !r.json) {
+    throw new Error(r.text || "VibeFoundry did not answer.");
+  }
+  return r.json;
+}
+
+async function vfConnect(args) {
+  const hub = String((args && args.hub) || "").trim();
+
+  if (hub) {
+    const state = await portalStatus();
+    const orgs = (state && state.orgs) || [];
+    // Bind only to something the phone book actually listed. A model that
+    // invents an address would otherwise point a project at a host nobody
+    // vouched for.
+    const chosen = orgs.find((o) => o.hub === hub || o.id === hub || o.name === hub);
+    if (!chosen) {
+      if (state.needs && state.needs !== "pick_org") {
+        return say(portalRemedy(state), state);
+      }
+      const names = orgs.map((o) => o.name).join(", ") || "none";
+      return say(
+        `"${hub}" is not one of the organizations you can reach. Available: ${names}.`,
+        state
+      );
+    }
+    const bound = await backendJson("/api/portal/bind", "POST", chosen);
+    if (bound.status !== 200) {
+      throw new Error((bound.json && bound.json.detail) || bound.text || "Could not connect.");
+    }
+  }
+
+  const state = await portalStatus();
+
+  if (state.ready) {
+    return say(
+      `Connected to ${state.org.name} as ${state.viewer}. Ask your question.`,
+      state
+    );
+  }
+
+  if (state.needs === "portal_signin") {
+    const started = await backendJson("/api/portal/signin/start", "POST");
+    if (started.status === 200 && started.json && started.json.url) {
+      // Opened here rather than described: the sign-in is a browser round trip
+      // the user completes, and asking a model to relay a URL reliably is the
+      // kind of thing that quietly stops working.
+      await openInBrowser(started.json.url);
+      return say(
+        `Opening the ${state.org.name} portal sign-in in your browser. ` +
+          "Sign in there, then ask your question again — it lasts an hour.",
+        { ...state, signInUrl: started.json.url }
+      );
+    }
+  }
+
+  return say(portalRemedy(state) || "Not connected to a portal yet.", state);
+}
+
+async function portalGuard() {
+  const state = await portalStatus();
+  if (state.ready) return null;
+  const remedy = portalRemedy(state);
+  return say(
+    remedy + " (Call vf_connect to do this.)",
+    { ...state, blocked: true }
+  );
+}
+
+async function vfTables(args) {
+  const blocked = await portalGuard();
+  if (blocked) return blocked;
+
+  const table = String((args && args.table) || "").trim();
+  const path = table
+    ? `/api/portal/tables/${encodeURIComponent(table)}/schema`
+    : "/api/portal/tables";
+  const r = await backendJson(path);
+  if (r.status !== 200) {
+    throw new Error((r.json && r.json.detail) || r.text || "The portal did not answer.");
+  }
+
+  if (table) {
+    const profile = r.json || {};
+    const columns = (profile.profile || []).length;
+    return say(
+      `${profile.title || table}: ${profile.rowCount || "?"} rows, ${columns} columns profiled.`,
+      profile
+    );
+  }
+  const tables = (r.json && r.json.tables) || [];
+  const summary = tables
+    .map((t) => `${t.id} (${t.rows != null ? t.rows : "?"} rows)`)
+    .join(", ");
+  return say(
+    tables.length ? `Tables you can read: ${summary}` : "This portal publishes no tables yet.",
+    r.json || {}
+  );
+}
+
+async function vfQuery(args) {
+  const blocked = await portalGuard();
+  if (blocked) return blocked;
+
+  const sql = String((args && args.sql) || "").trim();
+  if (!sql) throw new Error("Send a SQL statement.");
+  const body = { sql };
+  if (args && args.limit) body.limit = Number(args.limit);
+
+  const r = await backendJson("/api/portal/query", "POST", body);
+  if (r.status !== 200) {
+    const detail = (r.json && r.json.detail) || r.text || "The portal refused that query.";
+    // The gateway's refusals are already written for a person — a bad column,
+    // an ungranted table, a lapsed sign-in. Pass them through rather than
+    // wrapping them in something vaguer.
+    return say(detail, { error: detail, status: r.status });
+  }
+  const data = r.json || {};
+  const rows = data.row_count != null ? data.row_count : (data.rows || []).length;
+  return say(
+    `${rows} row${rows === 1 ? "" : "s"}${data.truncated ? " (truncated)" : ""} from ` +
+      `${(data.tables_used || []).join(", ") || "the portal"} in ${data.elapsed_ms || "?"}ms.`,
+    data
+  );
 }
 
 // --- vf_request ---------------------------------------------------------------
@@ -840,7 +1152,9 @@ async function handle(msg) {
       return result(id, {});
 
     case "tools/list":
-      return result(id, { tools: [OPEN_TOOL, SETUP_TOOL, PROXY_TOOL] });
+      return result(id, {
+        tools: [OPEN_TOOL, SETUP_TOOL, CONNECT_TOOL, TABLES_TOOL, QUERY_TOOL, PROXY_TOOL],
+      });
 
     case "tools/call": {
       const name = params.name;
@@ -945,6 +1259,9 @@ async function handle(msg) {
             isError: r.phase === "failed",
           });
         }
+        if (name === "vf_connect") return result(id, await vfConnect(args));
+        if (name === "vf_tables") return result(id, await vfTables(args));
+        if (name === "vf_query") return result(id, await vfQuery(args));
         if (name === "vf_request") return result(id, await proxy(args));
         return rpcError(id, -32602, "Unknown tool: " + name);
       } catch (e) {
